@@ -133,11 +133,13 @@ const NETS = [
   { cell: 1300, jit: 0.33 }, // Land- und Nebenstraßen
   { cell: 620,  jit: 0.38 }, // Waldwege
 ];
+// Fahrstreifen sind 36 px breit, das Auto inkl. Räder 28 px.
+const LANE = 36;
 const RT = {
-  hw:    { half: 42, sh: 8, col: '#4b4d53', name: 'Autobahn' },
-  road:  { half: 22, sh: 6, col: '#56585e', name: 'Landstraße' },
-  lane:  { half: 16, sh: 4, col: '#68696d', name: 'Nebenstraße' },
-  track: { half: 10, sh: 0, col: '#a08f70', name: 'Waldweg' },
+  hw:    { half: 83, sh: 8, col: '#4b4d53', name: 'Autobahn', rank: 3 },    // 7.5 Mitte + 2 Streifen + 3.5 Rand
+  road:  { half: 40, sh: 6, col: '#5a5b61', name: 'Landstraße', rank: 2 },  // 1 Streifen je Richtung + 4 Rand
+  lane:  { half: 30, sh: 4, col: '#5a5b61', name: 'Nebenstraße', rank: 2 },
+  track: { half: 14, sh: 0, col: '#a08f70', name: 'Waldweg', rank: 1 },
 };
 const segCache = new Map();
 const NO_ROADS = [];
@@ -197,7 +199,7 @@ function buildSeg(net, i, j, dir, key) {
   const deadEnd = net === 1 && (nodeDegree(net, i, j) < 2 || nodeDegree(net, i2, j2) < 2);
   const type = net === 0 ? 'hw' : net === 1 ? (!deadEnd && hash(i, j, SEED + 330 + dir) < 0.6 ? 'road' : 'lane') : 'track';
   const rt = RT[type];
-  return { key, net, type, half: rt.half, sh: rt.sh, col: rt.col, xs, ys, nx, ny, water, n,
+  return { key, net, i, j, dir, type, rank: rt.rank, half: rt.half, sh: rt.sh, col: rt.col, xs, ys, nx, ny, water, n,
            hasWater: wet > 0, minx, miny, maxx, maxy };
 }
 
@@ -341,34 +343,72 @@ function finalizeChunk(c) {
 // Straßen als Vektorlinien in den Chunk zeichnen. Jedes Segment wird komplett gezeichnet,
 // damit Strichmarkierungen über Chunkgrenzen hinweg nahtlos weiterlaufen.
 const MARK = 'rgba(238,238,228,0.92)';
+// Unterbrochene Teilstücke bekommen die Lauflänge als Strich-Offset, damit das Strichmuster
+// unabhängig von Lücken (und damit in jedem Chunk gleich) weiterläuft.
 function polyLine(g, s, off, w, col, dash, pred) {
   g.lineWidth = w; g.strokeStyle = col; g.setLineDash(dash || []);
-  g.beginPath();
-  let open = false;
+  let open = false, len = 0, px = 0, py = 0;
   for (let k = 0; k < s.n; k++) {
-    if (pred && !pred(k)) { open = false; continue; }
     const x = s.xs[k] + s.nx[k] * off, y = s.ys[k] + s.ny[k] * off;
-    if (open) g.lineTo(x, y); else { g.moveTo(x, y); open = true; }
+    if (k) len += Math.hypot(x - px, y - py);
+    px = x; py = y;
+    if (pred && !pred(k, x, y)) { if (open) { g.stroke(); open = false; } continue; }
+    if (open) g.lineTo(x, y);
+    else { g.beginPath(); g.lineDashOffset = len; g.moveTo(x, y); open = true; }
   }
-  g.stroke();
+  if (open) g.stroke();
 }
-function drawMarkings(g, s) {
+
+// Liegt (x,y) auf der Fahrbahn eines der Segmente? Segmentenden zählen ohne runde Kappe,
+// damit an T-Kreuzungen die gegenüberliegende Randlinie durchgehend bleibt.
+function onAnyBody(x, y, views) {
+  for (const v of views) {
+    const o = v.seg, m = o.half + 16;
+    if (x < o.minx - m || x > o.maxx + m || y < o.miny - m || y > o.maxy + m) continue;
+    for (let k = v.i0; k < v.i1; k++) {
+      const ax = o.xs[k], ay = o.ys[k];
+      if (Math.abs(x - ax) > m || Math.abs(y - ay) > m) continue;
+      const bx = o.xs[k + 1] - ax, by = o.ys[k + 1] - ay, px = x - ax, py = y - ay;
+      let t = (px * bx + py * by) / (bx * bx + by * by);
+      if ((k === 0 && t < 0) || (k === o.n - 2 && t > 1)) continue;
+      t = clamp(t, 0, 1);
+      if (Math.hypot(px - bx * t, py - by * t) < o.half + 1) return true;
+    }
+  }
+  return false;
+}
+
+// Markierungen enden dort, wo eine gleich- oder höherrangige Straße kreuzt oder einmündet.
+// Ausgenommen ist die eigene Fortsetzung (gleiches Netz, gleiche Gitterzeile bzw. -spalte).
+function markPred(c, s) {
+  const others = c.segs.filter(v => {
+    const o = v.seg;
+    if (o === s || o.rank < s.rank) return false;
+    if (o.net === s.net && o.dir === s.dir && (s.dir ? o.i === s.i : o.j === s.j)) return false;
+    return !(o.maxx < s.minx - 100 || o.minx > s.maxx + 100 || o.maxy < s.miny - 100 || o.miny > s.maxy + 100);
+  });
+  if (!others.length) return null;
+  const x0 = c.cx * CS - 20, y0 = c.cy * CS - 20, x1 = x0 + CS + 40, y1 = y0 + CS + 40;
+  return (k, x, y) => x < x0 || x > x1 || y < y0 || y > y1 || !onAnyBody(x, y, others);
+}
+
+function drawMarkings(g, s, p) {
   const h = s.half;
   if (s.type === 'hw') {
-    polyLine(g, s, 0, 5, '#a3a8ae');                 // Mittelleitplanke
+    polyLine(g, s, 0, 5, '#a3a8ae', null, p);                          // Mittelleitplanke
     for (const sg of [-1, 1]) {
-      polyLine(g, s, sg * 6.5, 1.6, MARK);
-      polyLine(g, s, sg * 23, 1.6, MARK, [22, 26]);  // Fahrstreifenbegrenzung
-      polyLine(g, s, sg * (h - 3.5), 2, MARK);       // Randlinie
+      polyLine(g, s, sg * 6.5, 1.6, MARK, null, p);
+      polyLine(g, s, sg * (7.5 + LANE), 1.6, MARK, [22, 26], p);      // Fahrstreifenbegrenzung
+      polyLine(g, s, sg * (7.5 + LANE * 2), 2, MARK, null, p);        // Randlinie
     }
   } else if (s.type === 'road') {
-    polyLine(g, s, 0, 1.8, MARK, [20, 22]);
-    polyLine(g, s, -(h - 3), 1.8, MARK);
-    polyLine(g, s, h - 3, 1.8, MARK);
+    polyLine(g, s, 0, 1.8, MARK, [20, 22], p);
+    polyLine(g, s, -(LANE + 1), 1.8, MARK, null, p);
+    polyLine(g, s, LANE + 1, 1.8, MARK, null, p);
   } else if (s.type === 'track') {
-    polyLine(g, s, 0, 3, 'rgba(96,128,62,0.55)');    // Grasnarbe in der Mitte
-    polyLine(g, s, -5.5, 4, 'rgba(110,90,60,0.5)');  // Fahrspuren
-    polyLine(g, s, 5.5, 4, 'rgba(110,90,60,0.5)');
+    polyLine(g, s, 0, 3, 'rgba(96,128,62,0.55)', null, p);            // Grasnarbe in der Mitte
+    polyLine(g, s, -7, 4, 'rgba(110,90,60,0.5)', null, p);            // Fahrspuren
+    polyLine(g, s, 7, 4, 'rgba(110,90,60,0.5)', null, p);
   }
 }
 function drawRoads(c) {
@@ -393,7 +433,7 @@ function drawRoads(c) {
     }
     for (const s of list) polyLine(g, s, 0, s.half * 2, s.col);
     g.lineCap = 'butt';
-    for (const s of list) drawMarkings(g, s);
+    for (const s of list) drawMarkings(g, s, markPred(c, s));
   }
   for (const s of segs) if (s.hasWater) {
     const p = wetPred(s);
@@ -1158,7 +1198,7 @@ function findSpawn() {
     }
     if (best) {
       const [s, k] = best;
-      return { x: s.xs[k] + s.nx[k] * 11, y: s.ys[k] + s.ny[k] * 11, a: Math.atan2(-s.nx[k], s.ny[k]) };
+      return { x: s.xs[k] + s.nx[k] * LANE / 2, y: s.ys[k] + s.ny[k] * LANE / 2, a: Math.atan2(-s.nx[k], s.ny[k]) };
     }
   }
   return { x: 0, y: 0, a: 0 };
