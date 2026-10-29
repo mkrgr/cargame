@@ -1422,6 +1422,7 @@ const CAR_TYPES = [
   { id: 'kitt',   name: 'KITT',       color: '#15171b' },
   { id: 'dmc',    name: 'DeLorean',   color: '#b9bec4', mode: ['Flammen aus', 'Flammen an'] },
   { id: 'van',    name: 'A-Team-Van', color: '#26292e', mode: ['Geschützturm eingefahren', 'Geschützturm feuert'] },
+  { id: 'homer',  name: 'Homers Auto', color: '#e9a0ac', mode: ['Brennstäbe behalten', 'wirft Brennstäbe'] },
 ];
 const AIR_TIME = 1.0, BOOST_COOLDOWN = 3, FLAME_KMH = 88;
 // Geschützturm des Vans: Winkel relativ zum Fahrzeug, Ausfahrgrad 0..1
@@ -1431,6 +1432,9 @@ const turret = { open: 0, ang: 0, target: 0, retarget: 0, fire: 0, flash: 0 };
 const bond = { open: 0, fire: 0, flash: 0, ejectCd: 0, hatch: 0, shot: 0 };
 const flyers = [];   // Beifahrer im Flug nach dem Schleudersitz
 const EJECT_TIME = 1.3, EJECT_COOLDOWN = 2.5;
+// Homers Auto: radioaktive Brennstäbe fliegen aus dem Fenster und leuchten am Boden weiter
+const rods = [], ROD_FLIGHT = 0.75, ROD_LIFE = 40, ROD_MAX = 60;
+let rodTimer = 0, rodSide = 1;
 const bullets = [];
 let clock = 0;
 const car = { x: 0, y: 0, a: 0, vx: 0, vy: 0, w: 0, steer: 0, vf: 0, vl: 0, type: 0, mode: false, air: 0, boostCd: 0,
@@ -1614,6 +1618,55 @@ function landPassenger(f) {
   if (!c || !c.done) return;
   c.dyn.push({ t: 'person', person: true, free: true, x, y, r: DYN.person.r, m: DYN.person.m, vx: 0, vy: 0,
                a: f.a, va: 0, c: '#2b2f36', hair: f.hair, walk: 20, timer: 1, phase: 0, down: 1.2, cross: 0 });
+}
+
+function updateRods(dt) {
+  if (CAR_TYPES[car.type].id === 'homer' && car.mode && car.air <= 0) {
+    rodTimer -= dt;
+    if (rodTimer <= 0) {
+      rodTimer = 0.55 + Math.random() * 0.4;
+      rodSide = -rodSide;                                            // abwechselnd aus beiden Seitenfenstern
+      const fx = Math.cos(car.a), fy = Math.sin(car.a), out = 90 + Math.random() * 90;
+      rods.push({ x: car.x - fy * 11 * rodSide, y: car.y + fx * 11 * rodSide, a: car.a + Math.random() * 3,
+                  vx: car.vx * 0.7 - fy * rodSide * out + fx * (Math.random() - .5) * 60,
+                  vy: car.vy * 0.7 + fx * rodSide * out + fy * (Math.random() - .5) * 60,
+                  spin: (Math.random() - .5) * 14, t: 0, landed: false, life: ROD_LIFE });
+      if (rods.length > ROD_MAX) rods.shift();
+    }
+  } else rodTimer = 0.2;
+  for (let i = rods.length - 1; i >= 0; i--) {
+    const r = rods[i];
+    r.x += r.vx * dt; r.y += r.vy * dt; r.a += r.spin * dt;
+    if (!r.landed) {
+      r.t += dt;
+      if (r.t >= ROD_FLIGHT) {                                        // Aufschlag mit grünen Funken
+        r.landed = true; r.vx *= 0.35; r.vy *= 0.35; r.spin *= 0.3;
+        for (let k = 0; k < 8; k++) {
+          const a = Math.random() * TAU, s = 30 + Math.random() * 60;
+          emit(r.x, r.y, Math.cos(a) * s, Math.sin(a) * s, 'rgba(140,255,90,', 1.5 + Math.random() * 1.5, 0.45);
+        }
+      }
+      continue;
+    }
+    const f = Math.exp(-4 * dt); r.vx *= f; r.vy *= f; r.spin *= f;
+    r.life -= dt;
+    if (r.life <= 0) { rods.splice(i, 1); continue; }
+    if (Math.random() < dt * 1.5) emit(r.x + (Math.random() - .5) * 10, r.y + (Math.random() - .5) * 10,
+                                      (Math.random() - .5) * 10, (Math.random() - .5) * 10, 'rgba(170,255,120,', 1.2, 0.6);
+  }
+}
+function drawRod(r) {
+  const lift = r.landed ? 0 : Math.sin(Math.PI * r.t / ROD_FLIGHT), sc = 1 + 0.9 * lift;
+  const fade = Math.min(1, r.life / 3), pulse = 0.7 + 0.3 * Math.sin(clock * 6 + r.x * 0.05);
+  ctx.save(); ctx.translate(r.x, r.y);
+  if (lift > 0) { ctx.fillStyle = `rgba(0,0,0,${(0.25 * (1 - lift)).toFixed(3)})`; ctx.fillRect(4 + 20 * lift, 5 + 26 * lift, 10, 4); }
+  ctx.rotate(r.a); ctx.scale(sc, sc); ctx.globalAlpha = fade;
+  ctx.fillStyle = `rgba(110,255,70,${(0.22 * pulse).toFixed(3)})`;   // Leuchthof
+  ctx.beginPath(); ctx.ellipse(0, 0, 13, 7, 0, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#2f9a2a'; rrect(-7.5, -2.2, 15, 4.4, 2.2);        // Stab
+  ctx.fillStyle = `rgba(200,255,150,${(0.85 * pulse).toFixed(3)})`; rrect(-6, -1, 12, 2, 1);
+  ctx.fillStyle = '#7d8086'; ctx.fillRect(-8, -2.4, 2, 4.8); ctx.fillRect(6, -2.4, 2, 4.8);  // Metallkappen
+  ctx.restore();
 }
 
 function carAction() {
@@ -2476,28 +2529,67 @@ function drawCar() {
       if (on) { ctx.fillStyle = 'rgba(80,150,255,0.35)'; circle(-2, blink ? -5 : 5, 11); }
       break;
     }
-    case 'bond': {                                                  // klassischer britischer Sportwagen
-      const o = bond.open;
-      if (o > 0.02) {                                                // Kugelfang fährt hinten aus
-        ctx.fillStyle = '#5c6066'; ctx.fillRect(-23 - 2 * o, -9, 2, 2); ctx.fillRect(-23 - 2 * o, 7, 2, 2);
-        ctx.fillStyle = '#3a3e44'; rrect(-23 - 5 * o, -12, 3.5, 24, 1);
-        ctx.fillStyle = 'rgba(255,255,255,0.18)'; ctx.fillRect(-23 - 5 * o, -11, 1, 22);
+    case 'bond': {                                                  // nach dem Vorbild des DB5
+      const o = bond.open, silver = '#c4c8c6';
+      ctx.fillStyle = '#d9dcdf';                                    // Speichenrad-Naben (Zentralverschluss)
+      for (const [wx, wy] of WHEELS) { ctx.fillRect(wx - 1.5, wy * 1.1 + (wy < 0 ? -3.2 : 1.7), 3, 1.5); }
+      // Karosserie: schmale runde Nase, lange Haube, ausgestellte hintere Kotflügel
+      ctx.fillStyle = silver;
+      ctx.beginPath();
+      ctx.moveTo(23, -5.5); ctx.quadraticCurveTo(24.8, 0, 23, 5.5);
+      ctx.quadraticCurveTo(21.5, 10, 15, 10.6); ctx.lineTo(3, 10.8);
+      ctx.quadraticCurveTo(-8, 12.6, -16, 12); ctx.quadraticCurveTo(-22.6, 11.4, -23.2, 6.5); ctx.lineTo(-23.2, -6.5);
+      ctx.quadraticCurveTo(-22.6, -11.4, -16, -12); ctx.quadraticCurveTo(-8, -12.6, 3, -10.8);
+      ctx.lineTo(15, -10.6); ctx.quadraticCurveTo(21.5, -10, 23, -5.5); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.2)';                      // Glanz auf der Lichtseite
+      ctx.beginPath(); ctx.ellipse(0, -8.5, 20, 2.2, 0, 0, TAU); ctx.fill();
+      ctx.fillStyle = 'rgba(0,0,0,0.08)';
+      ctx.beginPath(); ctx.ellipse(-2, 9, 20, 2, 0, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#b6bab8'; rrect(6, -2.8, 14, 5.6, 2.8);      // Hutze auf der Haube
+      ctx.fillStyle = '#4a4d50'; ctx.fillRect(17.5, -1.4, 2, 2.8);
+      ctx.fillStyle = '#2a2c2f';                                    // flacher ovaler Kühlergrill
+      ctx.beginPath(); ctx.ellipse(23.2, 0, 1.1, 3.8, 0, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#f2f4f5';                                    // abgedeckte Scheinwerfer
+      ctx.beginPath(); ctx.ellipse(21.2, -7.2, 1.7, 2.1, 0.3, 0, TAU); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(21.2, 7.2, 1.7, 2.1, -0.3, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#8a8e8c';                                    // Kiemen hinter den Vorderrädern
+      for (const sy of [-1, 1]) for (let q = 0; q < 3; q++) ctx.fillRect(7.5 - q * 1.6, sy * 9.6 - 0.4, 0.9, 1.6 * sy);
+      ctx.fillStyle = glass;                                        // geneigte Frontscheibe
+      ctx.beginPath(); ctx.moveTo(0.5, -8.6); ctx.lineTo(5.5, -7.4); ctx.lineTo(5.5, 7.4); ctx.lineTo(0.5, 8.6); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = silver; rrect(-9, -8.4, 9.8, 16.8, 2.5);      // Dach
+      ctx.fillStyle = 'rgba(255,255,255,0.15)'; rrect(-8.5, -7.8, 8.5, 4, 1.5);
+      ctx.fillStyle = glass;                                        // große, flach auslaufende Heckscheibe (Fastback)
+      ctx.beginPath(); ctx.moveTo(-9, -8.2); ctx.lineTo(-9, 8.2); ctx.lineTo(-16.5, 6.4); ctx.lineTo(-16.5, -6.4); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(-12, -6, 2, 12);
+      if (bond.hatch > 0) { ctx.fillStyle = '#121316'; ctx.fillRect(-8, -7.6, 7.5, 6.5); }  // offene Dachluke
+      if (o > 0.02) {                                                // Kugelfang hinter der Heckscheibe
+        ctx.fillStyle = `rgba(0,0,0,${(0.35 * o).toFixed(3)})`;
+        ctx.fillRect(-19 - 5 * o, -7.6, 5 * o + 1, 15.2 + 2 * o);   // Schatten wächst mit der Höhe
+        ctx.fillStyle = '#3a3e44'; ctx.fillRect(-19, -7.6, 2.6, 15.2);
+        ctx.fillStyle = `rgba(255,255,255,${(0.3 * o).toFixed(3)})`; ctx.fillRect(-16.8, -7.6, 0.6, 15.2);
       }
-      ctx.fillStyle = '#c9ccc8'; rrect(-23, -11.5, 46, 23, 9);
-      ctx.fillStyle = 'rgba(255,255,255,0.22)'; rrect(-21, -9.5, 42, 6, 4);
-      ctx.fillStyle = '#b3b7b3'; ctx.fillRect(6, -0.8, 15, 1.6);      // Lufthutze auf der langen Haube
-      ctx.fillStyle = glass;
-      ctx.beginPath(); ctx.moveTo(1, -9.5); ctx.lineTo(7, -8); ctx.lineTo(7, 8); ctx.lineTo(1, 9.5); ctx.closePath(); ctx.fill();
-      ctx.beginPath(); ctx.moveTo(-12, -8.5); ctx.lineTo(-15.5, -7.5); ctx.lineTo(-15.5, 7.5); ctx.lineTo(-12, 8.5); ctx.closePath(); ctx.fill();
-      ctx.fillStyle = '#c9ccc8'; rrect(-12, -8.5, 13, 17, 3);
-      if (bond.hatch > 0) { ctx.fillStyle = '#121316'; ctx.fillRect(-10, -8, 9, 7); }  // offene Dachluke
-      ctx.fillStyle = '#e2e4e6'; ctx.fillRect(22, -10, 1.5, 20); ctx.fillRect(-24, -10, 1.5, 20);  // Chromstoßstangen
+      ctx.fillStyle = '#e6e8ea';                                    // Chromstoßstangen mit Hörnern
+      ctx.fillRect(23.6, -6, 1.2, 12); ctx.fillRect(22.8, -4.6, 2.4, 1.4); ctx.fillRect(22.8, 3.2, 2.4, 1.4);
+      ctx.fillRect(-24.4, -8, 1.2, 16); ctx.fillRect(-25, -6, 2.4, 1.4); ctx.fillRect(-25, 4.6, 2.4, 1.4);
       if (o > 0.02) {                                                // Maschinengewehre hinter den Blinkern
-        ctx.fillStyle = '#1b1d20'; ctx.fillRect(22, -8, 5 * o, 2); ctx.fillRect(22, 6, 5 * o, 2);
+        ctx.fillStyle = '#1b1d20'; ctx.fillRect(22, -7.8, 5 * o, 1.8); ctx.fillRect(22, 6, 5 * o, 1.8);
         if (bond.flash > 0 && o > 0.9) {
           ctx.fillStyle = 'rgba(255,220,90,0.9)';
           circle(28, bond.shot % 2 ? -7 : 7, 3);
         }
+      }
+      break;
+    }
+    case 'homer': {                                                  // rosa Limousine mit Dellen und Grundierung
+      sedan('#e9a0ac', '#e9a0ac');
+      ctx.fillStyle = '#9a9c98'; rrect(12, -9, 8, 7, 2);             // graue Grundierungsstelle an der Haube
+      ctx.strokeStyle = 'rgba(120,40,60,0.55)'; ctx.lineWidth = 1;   // Dellen
+      ctx.beginPath(); ctx.arc(-17, 8, 3, Math.PI * 1.1, Math.PI * 1.9); ctx.stroke();
+      ctx.beginPath(); ctx.arc(16, 9, 2.4, Math.PI * 1.2, Math.PI * 1.8); ctx.stroke();
+      ctx.beginPath(); ctx.arc(-4, -10.5, 2, Math.PI * 0.1, Math.PI * 0.9); ctx.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,0.25)'; ctx.fillRect(-2, -12.2, 3, 1.2);  // Kratzer
+      if (car.mode) {                                                 // heruntergekurbelte Fenster
+        ctx.fillStyle = '#121316'; ctx.fillRect(-9, -11, 9, 2); ctx.fillRect(-9, 9, 9, 2);
       }
       break;
     }
@@ -2552,8 +2644,10 @@ function drawCar() {
     }
   }
   const fl = van ? 25 : 20, rl = van ? -27 : -23;
-  ctx.fillStyle = '#fff6c8';
-  ctx.fillRect(fl, -10, 3, 5); ctx.fillRect(fl, 5, 3, 5);
+  if (id !== 'bond') {                                              // der 007 hat eigene runde Scheinwerfer
+    ctx.fillStyle = '#fff6c8';
+    ctx.fillRect(fl, -10, 3, 5); ctx.fillRect(fl, 5, 3, 5);
+  }
   const rear = car.braking ? '#ff2a1a' : car.reversing ? '#ffffff' : '#7a1810';
   if (car.braking || car.reversing) {
     ctx.fillStyle = car.braking ? 'rgba(255,40,20,0.35)' : 'rgba(255,255,255,0.3)';
@@ -2597,6 +2691,7 @@ function render() {
   for (const o of highs) drawShadow(o);
   for (const o of lows) drawStatic(o);
   for (const o of dyns) drawDyn(o);
+  for (const r of rods) if (r.landed) drawRod(r);
   if (!car.upper) drawCar();
   const decks = new Set();
   for (let cy = Math.floor(by0 / CS); cy <= Math.floor(by1 / CS); cy++) {
@@ -2620,6 +2715,7 @@ function render() {
   for (const s of tsegs) drawPortals(s);
   for (const z of decks) drawDeck(z);
   if (car.upper) drawCar();
+  for (const r of rods) if (!r.landed) drawRod(r);
   for (const f of flyers) {                                         // Beifahrer samt Sitz im Flug
     const k = f.t / EJECT_TIME, lift = Math.sin(Math.PI * k), sc = 1 + 1.6 * lift;
     ctx.fillStyle = `rgba(0,0,0,${(0.3 - 0.15 * lift).toFixed(3)})`;
@@ -2702,6 +2798,7 @@ function specialLights() {
     const a = car.a + turret.ang, bx = car.x + fx * TURRET_X + Math.cos(a) * 19, by = car.y + fy * TURRET_X + Math.sin(a) * 19;
     out.push({ x: bx, y: by, r: 110, cut: 0.6, glow: 0.35, col: rgba(255, 190, 90) });
   }
+  for (const r of rods.slice(-20)) out.push({ x: r.x, y: r.y, r: 55, cut: 0.45 * Math.min(1, r.life / 3), glow: 0.3 * Math.min(1, r.life / 3), col: rgba(110, 255, 70) });
   if (id === 'kitt') {
     const sy = Math.sin(clock * 5) * 7.5;
     out.push({ x: car.x + fx * 21 - fy * sy, y: car.y + fy * 21 + fx * sy, r: 22, cut: 0.3, glow: 0.5, col: rgba(255, 30, 20) });
@@ -2917,6 +3014,7 @@ function newWorld(seed) {
   crossCache.clear();
   setlCache.clear();
   rivCache.clear();
+  rods.length = 0;
   allCrossings.length = 0;
   car.zone = null; car.upper = false;
   particles.length = 0;
@@ -2947,6 +3045,7 @@ function frame(now) {
   car.boostCd = Math.max(0, car.boostCd - dt);
   updateTurret(dt);
   updateBond(dt);
+  updateRods(dt);
   nightLevel += ((night ? 1 : 0) - nightLevel) * Math.min(1, dt * 2.5);
 
   ensureChunks();
