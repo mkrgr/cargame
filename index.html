@@ -20,6 +20,8 @@
   #place { margin-top: 4px; font-size: 13px; color: #ffd36b; min-height: 0; }
   #place:empty { display: none; }
   #cartype { margin-top: 6px; font-size: 12px; opacity: .75; }
+  #assist { margin-top: 3px; font-size: 12px; color: #7be3a0; }
+  #assist:empty { display: none; }
   #mapWrap { right: 16px; top: 16px; padding: 8px; }
   #map { display: block; width: 180px; height: 180px; border-radius: 9px; }
   #seedRow { font-size: 12px; opacity: .65; text-align: center; margin-top: 6px; }
@@ -42,6 +44,7 @@
   <div id="surf"><i id="swatch"></i><span id="surfName">–</span></div>
   <div id="place"></div>
   <div id="cartype"></div>
+  <div id="assist"></div>
 </div>
 
 <div id="mapWrap" class="panel">
@@ -56,7 +59,7 @@
   <div><b>Leertaste</b>Handbremse</div>
   <div><b>R</b>Neue Welt &nbsp; <b style="min-width:0">C</b> Fahrzeug &nbsp; <b style="min-width:0">H</b> Hilfe</div>
   <div><b>M</b>Sonderfunktion &nbsp; <b style="min-width:0">E</b> Schleudersitz (007)</div>
-  <div><b>N</b>Nacht an/aus</div>
+  <div><b>N</b>Nacht an/aus &nbsp; <b style="min-width:0">L</b> Spurhalteassistent</div>
 </div>
 
 <div id="intro"><div><h1>Kleiner Flitzer</h1><p>Drück eine Taste und fahr los</p></div></div>
@@ -1732,6 +1735,7 @@ addEventListener('keydown', e => {
   if (e.code === 'KeyC') { car.type = (car.type + 1) % CAR_TYPES.length; car.mode = false; }
   if (e.code === 'KeyM') carAction();
   if (e.code === 'KeyE') ejectSeat();
+  if (e.code === 'KeyL') assistOn = !assistOn;
   if (e.code === 'KeyH') document.getElementById('help').classList.toggle('hidden');
   if (e.code === 'KeyN') night = !night;
 });
@@ -2021,11 +2025,16 @@ function physics(dt) {
   let vf = car.vx * fx + car.vy * fy;
   let vl = car.vx * rx + car.vy * ry;
 
-  const steerIn = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+  // eigene Lenkung hat Vorrang, sonst lenkt der Spurhalteassistent (falls aktiv)
+  const manual = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+  const steerIn = manual || (car.assistActive ? car.assistSteer : 0);
   car.steer += (steerIn - car.steer) * Math.min(1, dt * 7);
 
   car.braking = false; car.throttle = 0;
-  if (keys.up) {
+  if (keys.up && car.assistBrake && vf > 0) {                       // Assistent: vor der Kurve abbremsen
+    vf = Math.max(0, vf - BRAKE * 0.45 * B * dt);
+    car.braking = true;
+  } else if (keys.up) {
     if (vf < -10) { brake(); }
     else {
       const lim = TOP * T;
@@ -2653,6 +2662,111 @@ function drawTrains() {
   }
 }
 
+// ---------- Fahrassistent ----------
+// Spurhalteassistent: schaut abhängig vom Tempo voraus, erkennt die Fahrtrichtung auf der Straße
+// und lenkt sanft zur Mitte des rechten Fahrstreifens (auf der Autobahn: des aktuellen rechten
+// Streifens). Auf Brücken und in Unterführungen zählt nur die eigene Ebene.
+let assistOn = false;
+const ASSIST_LAT = 650; // zulässige Querbeschleunigung in px/s² für das Kurventempo
+function laneCenters(s) {
+  if (s.type === 'hw') return [7.5 + LANE / 2, 7.5 + LANE * 1.5];
+  if (s.type === 'track') return [0];
+  return [s.half / 2];
+}
+function computeAssist() {
+  car.assistActive = false; car.assistSteer = 0; car.assistPath = null; car.assistBrake = false;
+  if (!assistOn || car.air > 0 || car.vf < 50) return;
+  const z = car.zone, views = z ? (car.upper ? z.upV : z.loV) : segsNear(car.x, car.y, car.x, car.y);
+  // bei der bisher verfolgten Straße (oder ihrer Fortsetzung) bleiben, damit Kreuzungen nicht abbiegen lassen
+  let s = null, k = 0;
+  const prev = car.assistSeg;
+  if (prev) {
+    let be = 4;
+    for (const v of views) {
+      const q = v.seg;
+      const same = q === prev || (q.net === prev.net && q.net !== 3 && q.dir === prev.dir && (q.dir ? q.i === prev.i : q.j === prev.j));
+      if (!same) continue;
+      const R1 = roadQuery(car.x, car.y, [v]);
+      if (R1.seg && R1.edge <= be) { be = R1.edge; s = R1.seg; k = R1.k; }
+    }
+  }
+  if (!s) {
+    const R = roadQuery(car.x, car.y, views);
+    if (!R.seg || R.edge > 6) { car.assistSeg = null; return; }
+    s = R.seg; k = R.k;
+  }
+  car.assistSeg = s;
+  const fx = Math.cos(car.a), fy = Math.sin(car.a);
+  const dir = s.ny[k] * fx - s.nx[k] * fy >= 0 ? 1 : -1;             // Fahrtrichtung entlang der Straße
+  const nx = s.nx[k] * dir, ny = s.ny[k] * dir;                     // Normale zur rechten Seite
+  const carOff = (car.x - s.xs[k]) * nx + (car.y - s.ys[k]) * ny;
+  let target = 0, bd = Infinity;
+  for (const c of laneCenters(s)) if (Math.abs(c - carOff) < bd) { bd = Math.abs(c - carOff); target = c; }
+  // Weg voraus entlang der Straße, über Knoten hinweg (Lenkziel und Kurventempo)
+  const look = 30 + car.vf * 0.28, ahead = Math.max(look, 60 + car.vf * 0.9);
+  const pts = roadAhead(s, k, dir, target, ahead);
+  const path = [];
+  let goal = pts[pts.length - 1];
+  for (const p of pts) { path.push([p.x, p.y]); if (p.d >= look) { goal = p; break; } }
+  let kmax = 0;
+  for (const p of pts) if (p.d > 25) {
+    let dth = p.a - pts[0].a;
+    dth = Math.abs(Math.atan2(Math.sin(dth), Math.cos(dth)));
+    kmax = Math.max(kmax, dth / p.d);
+  }
+  // höchstes Tempo, bei dem die Lenkung die Krümmung noch schafft: Gierrate 2.7/(1+v/650) ≥ κ·v,
+  // mit Sicherheitsfaktor; zusätzlich durch die zulässige Querbeschleunigung begrenzt
+  const yawCap = 2.7 * 0.62;
+  const vSteer = kmax > 1e-4 ? (-kmax + Math.sqrt(kmax * kmax + 4 * (kmax / 650) * yawCap)) / (2 * kmax / 650) : Infinity;
+  const vmax = kmax > 1e-4 ? Math.min(vSteer, Math.sqrt(ASSIST_LAT / kmax)) : Infinity;
+  car.assistBrake = car.vf > vmax * 1.05;
+  let da = Math.atan2(goal.y - car.y, goal.x - car.x) - car.a;
+  da = Math.atan2(Math.sin(da), Math.cos(da));
+  car.assistSteer = clamp(da * 2.2, -1, 1);
+  car.assistActive = true;
+  car.assistPath = path;
+}
+// Punkte entlang der Straße voraus (Abstand d, Richtung a, auf der Fahrstreifenmitte); am
+// Segmentende geht es mit der Fortsetzung weiter, die am geradesten anschließt
+function roadAhead(s, k, dir, lane, maxD) {
+  const out = [];
+  let d = 0, px = s.xs[k], py = s.ys[k], guard = 0;
+  for (;;) {
+    const off = Math.min(lane, laneCenters(s).reduce((m, c) => Math.max(m, c), 0) || lane);
+    for (; k >= 0 && k < s.n; k += dir) {
+      d += Math.hypot(s.xs[k] - px, s.ys[k] - py); px = s.xs[k]; py = s.ys[k];
+      out.push({ x: px + s.nx[k] * dir * off, y: py + s.ny[k] * dir * off, a: Math.atan2(-s.nx[k] * dir, s.ny[k] * dir), d });
+      if (d >= maxD) return out;
+    }
+    if (++guard > 4) return out;
+    const n = nextRoadSeg(s, dir > 0);
+    if (!n) return out;
+    s = n.seg; dir = n.dir; k = n.dir > 0 ? 1 : s.n - 2;
+  }
+}
+function nextRoadSeg(s, atEnd) {
+  const i = atEnd ? s.n - 1 : 0, x = s.xs[i], y = s.ys[i];
+  const ox = (atEnd ? 1 : -1) * s.ny[i], oy = (atEnd ? 1 : -1) * -s.nx[i];   // Richtung, in der man den Knoten verlässt
+  let best = null, bs = -0.3;
+  for (const v of segsNear(x, y, x, y)) {
+    const q = v.seg;
+    if (q === s || q.type === 'track' && s.type !== 'track') continue;
+    for (const [j, d] of [[0, 1], [q.n - 1, -1]]) {
+      if (Math.hypot(q.xs[j] - x, q.ys[j] - y) > 4) continue;
+      const sc = (q.ny[j] * d) * ox + (-q.nx[j] * d) * oy;
+      if (sc > bs) { bs = sc; best = { seg: q, dir: d }; }
+    }
+  }
+  return best;
+}
+function drawAssist() {
+  const p = car.assistPath;
+  if (!p || p.length < 2) return;
+  ctx.strokeStyle = 'rgba(90,230,140,0.55)'; ctx.lineWidth = 3; ctx.setLineDash([10, 8]); ctx.lineCap = 'round';
+  ctx.beginPath(); p.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.stroke();
+  ctx.setLineDash([]); ctx.lineCap = 'butt';
+}
+
 // ---------- Kamera ----------
 const cam = { x: 0, y: 0, z: 1 };
 function baseZoom() { return clamp(Math.min(W, H) / 820, 0.55, 1.25); }
@@ -3272,6 +3386,7 @@ function render() {
   }
   for (const z of railDecks) drawDeck(z);                           // Autobahnbrücken über die Bahn
   for (const r of rods) if (r.landed) drawRod(r);
+  drawAssist();
   if (!car.upper) drawCar();
   for (const L of levels) drawLevel(L);
   const decks = new Set();
@@ -3570,6 +3685,7 @@ function drawMap() {
 const elSpd = document.getElementById('spd'), elGear = document.getElementById('gear');
 const elSurf = document.getElementById('surfName'), elSw = document.getElementById('swatch');
 const elPlace = document.getElementById('place'), elType = document.getElementById('cartype');
+const elAssist = document.getElementById('assist');
 let hudName = '';
 function updateHud() {
   elSpd.textContent = Math.round(Math.abs(car.vf) * KMH);
@@ -3597,6 +3713,8 @@ function updateHud() {
                  (T.id === 'bond' ? ' · Schleudersitz ' + (bond.ejectCd > 0 ? 'lädt' : 'bereit (E)') : '');
   const typeText = T.name + (status ? ' · ' + status : '');
   if (elType.textContent !== typeText) elType.textContent = typeText;
+  const at = assistOn ? 'Spurhalteassistent ' + (car.assistActive ? 'lenkt' : 'bereit') + ' (L)' : '';
+  if (elAssist.textContent !== at) elAssist.textContent = at;
   if (name !== hudName) {
     hudName = name;
     elSurf.textContent = name;
@@ -3658,6 +3776,7 @@ function frame(now) {
   frameNo++;
 
   gatherNearby();
+  computeAssist();
   const steps = Math.max(1, Math.ceil(dt * 120));
   for (let i = 0; i < steps; i++) physics(dt / steps);
   updateDyn(dt);
