@@ -17,6 +17,8 @@
     background: rgba(255,255,255,0.1); }
   #surf { margin-top: 10px; font-size: 14px; display: flex; align-items: center; gap: 8px; opacity: .9; }
   #swatch { width: 14px; height: 14px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.3); display: inline-block; }
+  #place { margin-top: 4px; font-size: 13px; color: #ffd36b; min-height: 0; }
+  #place:empty { display: none; }
   #mapWrap { right: 16px; top: 16px; padding: 8px; }
   #map { display: block; width: 180px; height: 180px; border-radius: 9px; }
   #seedRow { font-size: 12px; opacity: .65; text-align: center; margin-top: 6px; }
@@ -37,6 +39,7 @@
 <div id="dash" class="panel">
   <span id="gear">N</span><span id="spd">0</span><small>km/h</small>
   <div id="surf"><i id="swatch"></i><span id="surfName">–</span></div>
+  <div id="place"></div>
 </div>
 
 <div id="mapWrap" class="panel">
@@ -106,7 +109,7 @@ function mulberry32(a) {
 // ---------- Untergründe ----------
 const S_DEEP = 0, S_SHALLOW = 1, S_ASPHALT = 2, S_GRAVEL = 3, S_GRASS = 4, S_SAND = 5,
       S_MUD = 6, S_SNOW = 7, S_ICE = 8, S_BRIDGE = 9, S_DENSE = 10, S_ROCK = 11, S_CLIFF = 12,
-      S_PASTURE = 13, S_WHEAT = 14, S_CORN = 15, S_PLOW = 16;
+      S_PASTURE = 13, S_WHEAT = 14, S_CORN = 15, S_PLOW = 16, S_URBAN = 17;
 // grip: Seitenhaftung, accel/top: Anteil an Motorleistung/Höchstgeschwindigkeit, drag: Rollwiderstand, brake: Bremswirkung
 const SURF = [
   { name: 'Tiefes Wasser',  rgb: [34, 86, 140],   grip: 3,   accel: .4,  top: .4,  drag: 1.6, brake: .6, solid: true },
@@ -126,6 +129,7 @@ const SURF = [
   { name: 'Weizenfeld',     rgb: [214, 180, 92],  grip: 4,   accel: .6,  top: .6,  drag: 1,   brake: .75, track: 'rgba(150,118,50,0.35)', dust: 'rgba(232,204,128,' },
   { name: 'Maisfeld',       rgb: [86, 128, 48],   grip: 3.6, accel: .5,  top: .45, drag: 1.6, brake: .8, track: 'rgba(52,72,26,0.42)', dust: 'rgba(120,160,64,' },
   { name: 'Acker',          rgb: [122, 92, 62],   grip: 3.2, accel: .55, top: .55, drag: 1.1, brake: .7, track: 'rgba(70,50,30,0.35)', dust: 'rgba(146,114,82,' },
+  { name: 'Pflaster',       rgb: [156, 152, 144], grip: 8,   accel: 1,   top: .9,  drag: .15, brake: 1,  skid: 'rgba(30,30,30,0.3)' },
 ];
 
 let lastE = 0, lastM = 0, lastH = 0, lastCold = false, lastPW = 0;
@@ -165,15 +169,21 @@ function crownAt(x, y) {
   return CROWN;
 }
 // Gebirgshöhe 0..1: großräumige Maske mal Grate. >0.35 Fels, >0.6 Felswand, >0.8 Schneegipfel
-function mtnH(x, y) {
+function mtnH(x, y, setl) {
   const mask = fbm(x / 2600, y / 2600, SEED + 80, 3);
   if (mask < 0.6) return 0;
   let k = clamp((mask - 0.6) / 0.12, 0, 1);
   k = k * k * (3 - 2 * k);
+  const S = setlQuery(x, y, setl || settlementsNear(x, y, x, y)); // Siedlungen liegen im ebenen Gelände
+  if (S.s) k *= clamp((S.f - 1) / 0.3, 0, 1);
   return k * (0.3 + 0.7 * ridged(x / 600, y / 600, SEED + 81, 4));
 }
 function autumnAt(x, y) { return fbm(x / 1600, y / 1600, SEED + 90, 2) > 0.6; }
-function isWater(x, y) { return elev(x, y) < WL && mtnH(x, y) < 0.2; }
+function isWater(x, y) {
+  if (elev(x, y) >= WL || mtnH(x, y) >= 0.2) return false;
+  const S = setlQuery(x, y, settlementsNear(x, y, x, y));
+  return !S.s || S.f >= 1.3;
+}
 
 // ---------- Straßennetz ----------
 // Drei Netze auf unterschiedlich groben Gittern: verschobene Knoten, verbunden durch Bézierkurven
@@ -191,6 +201,7 @@ const RT = {
   road:  { half: 40, sh: 6, col: '#5a5b61', name: 'Landstraße', rank: 2 },  // 1 Streifen je Richtung + 4 Rand
   lane:  { half: 30, sh: 4, col: '#5a5b61', name: 'Nebenstraße', rank: 2 },
   track: { half: 20, sh: 0, col: '#a08f70', name: 'Waldweg', rank: 1 },
+  street: { half: 30, sh: 8, col: '#55565c', name: 'Stadtstraße', rank: 2 },     // mit Gehweg statt Bankett
 };
 const segCache = new Map();
 const NO_ROADS = [];
@@ -248,7 +259,10 @@ function buildSeg(net, i, j, dir, key) {
       const a = Math.max(0, q - 1), b = Math.min(n - 1, q + 1);
       const tx = ox[b] - ox[a], ty = oy[b] - oy[a], l = Math.hypot(tx, ty) || 1;
       if (q) arc += Math.hypot(ox[q] - ox[q - 1], oy[q] - oy[q - 1]);
-      const off = amp * Math.sin(Math.PI * q / (n - 1)) * Math.sin(arc / 520 * TAU + phase);
+      // in und um Ortschaften verläuft die Straße ohne Serpentinen
+      const S = setlQuery(ox[q], oy[q], settlementsNear(ox[q], oy[q], ox[q], oy[q]));
+      const calm = S.s ? clamp((S.f - 1.1) / 0.6, 0, 1) : 1;
+      const off = amp * calm * Math.sin(Math.PI * q / (n - 1)) * Math.sin(arc / 520 * TAU + phase);
       xs[q] = ox[q] - ty / l * off; ys[q] = oy[q] + tx / l * off;
     }
   }
@@ -306,25 +320,28 @@ function findTunnels(hs, n) {
 // Alle Segmente nahe eines Rechtecks, jeweils auf den relevanten Stützpunktbereich beschnitten
 function segsNear(x0, y0, x1, y1) {
   const out = [];
+  const push = s => {
+    const m = s.half + s.sh + 60;
+    if (s.maxx < x0 - m || s.minx > x1 + m || s.maxy < y0 - m || s.miny > y1 + m) return;
+    let i0 = -1, i1 = -1;
+    for (let k = 0; k < s.n; k++) {
+      const x = s.xs[k], y = s.ys[k];
+      if (x >= x0 - m && x <= x1 + m && y >= y0 - m && y <= y1 + m) { if (i0 < 0) i0 = k; i1 = k; }
+    }
+    if (i0 >= 0) out.push({ seg: s, i0: Math.max(0, i0 - 1), i1: Math.min(s.n - 1, i1 + 1) });
+  };
   for (let net = 0; net < 3; net++) {
     const cell = NETS[net].cell;
     for (let j = Math.floor(y0 / cell) - 2; j <= Math.floor(y1 / cell) + 1; j++) {
       for (let i = Math.floor(x0 / cell) - 2; i <= Math.floor(x1 / cell) + 1; i++) {
         for (let dir = 0; dir < 2; dir++) {
           const s = getSeg(net, i, j, dir);
-          if (!s) continue;
-          const m = s.half + s.sh + 60;
-          if (s.maxx < x0 - m || s.minx > x1 + m || s.maxy < y0 - m || s.miny > y1 + m) continue;
-          let i0 = -1, i1 = -1;
-          for (let k = 0; k < s.n; k++) {
-            const x = s.xs[k], y = s.ys[k];
-            if (x >= x0 - m && x <= x1 + m && y >= y0 - m && y <= y1 + m) { if (i0 < 0) i0 = k; i1 = k; }
-          }
-          if (i0 >= 0) out.push({ seg: s, i0: Math.max(0, i0 - 1), i1: Math.min(s.n - 1, i1 + 1) });
+          if (s) push(s);
         }
       }
     }
   }
+  for (const st of settlementsNear(x0, y0, x1, y1)) for (const s of st.streets) push(s);
   out.sort((a, b) => b.seg.net - a.seg.net || (a.seg.key < b.seg.key ? -1 : a.seg.key > b.seg.key ? 1 : 0));
   return out;
 }
@@ -368,8 +385,8 @@ function makeCrossing(a, b, i, j, x, y) {
   const sin = Math.max(0.4, Math.abs(a.ny[i] * -b.nx[j] - -a.nx[i] * b.ny[j]));
   // a ist immer die Autobahn; Waldwege liegen nie auf einer Brücke
   // im Tunnel liegt die Autobahn immer unten
-  const aUp = !(a.tunnel && a.tunnel[i]) &&
-              (b.type === 'track' || hash(Math.floor(x / 64), Math.floor(y / 64), SEED + 700) < 0.5);
+  const aUp = !(a.tunnel && a.tunnel[i]) &&                 // in Städten verläuft sie aufgeständert
+              (b.type === 'track' || b.net === 3 || hash(Math.floor(x / 64), Math.floor(y / 64), SEED + 700) < 0.5);
   const up = aUp ? a : b, lo = aUp ? b : a;
   const span = (lo.half + lo.sh + UNDERPASS_CLEAR) / sin + 24;     // halbe Brückenlänge
   const R = Math.max(span + 80, (up.half + up.sh + 30) / sin);
@@ -377,8 +394,8 @@ function makeCrossing(a, b, i, j, x, y) {
 }
 // Das Segment samt Vorgänger und Nachfolger derselben Straße, beschnitten auf den Umkreis rad
 function chainViews(s, x, y, rad) {
-  const prev = getSeg(s.net, s.dir ? s.i : s.i - 1, s.dir ? s.j - 1 : s.j, s.dir);
-  const next = getSeg(s.net, s.dir ? s.i : s.i + 1, s.dir ? s.j + 1 : s.j, s.dir);
+  const prev = s.net === 3 ? null : getSeg(s.net, s.dir ? s.i : s.i - 1, s.dir ? s.j - 1 : s.j, s.dir);
+  const next = s.net === 3 ? null : getSeg(s.net, s.dir ? s.i : s.i + 1, s.dir ? s.j + 1 : s.j, s.dir);
   const out = [];
   for (const q of [prev, s, next]) {
     if (!q) continue;
@@ -425,22 +442,25 @@ function roadQuery(x, y, views) {
   return RQ;
 }
 
-function surfaceAt(x, y, views) {
-  const e = elev(x, y), h = mtnH(x, y);
+function surfaceAt(x, y, views, setl) {
+  const list = setl || settlementsNear(x, y, x, y);
+  const e = elev(x, y), h = mtnH(x, y, list);
+  const S = setlQuery(x, y, list), town = S.s, sf = town ? S.f : 99;
   const t = fbm(x / 2400, y / 2400, SEED + 31, 3);
-  const cold = t < 0.39, water = e < WL && h < 0.2;
+  const cold = t < 0.39, water = e < WL && h < 0.2 && sf >= 1.3;
   const R = roadQuery(x, y, views || segsNear(x, y, x, y));
   lastE = e; lastH = h; lastCold = cold;
   let verge = false;
   if (R.seg) {
     if (R.edge < 0) return R.seg.type === 'track' ? S_GRAVEL : (water ? S_BRIDGE : S_ASPHALT);
-    if (R.edge < R.seg.sh && !water) return S_GRAVEL;
+    if (R.edge < R.seg.sh && !water) return R.seg.type === 'street' ? S_URBAN : S_GRAVEL;
     verge = R.seg.type === 'track' && R.edge < TRACK_VERGE;
   }
   if (water) return cold ? S_ICE : (e < WD ? S_DEEP : S_SHALLOW);
+  if (sf < 1 + 0.16 * (vnoise(x / 70, y / 70, SEED + 77) - 0.5)) return urbanGround(town, x, y, cold);
   if (h > 0.6) return S_CLIFF;
   if (h > 0.35) return S_ROCK;
-  if (e < WL + 0.025 && h < 0.2) return cold ? S_SNOW : S_SAND;
+  if (e < WL + 0.025 && h < 0.2 && sf >= 1.3) return cold ? S_SNOW : S_SAND;
   const m = fbm(x / 800, y / 800, SEED + 47, 3);
   const f = forestAt(x, y);
   lastM = m;
@@ -475,6 +495,233 @@ function parcelAt(x, y) {
   return PARCEL;
 }
 
+// ---------- Siedlungen ----------
+// Großstädte liegen an Autobahnknoten (die Autobahn führt hindurch), Kleinstädte und Dörfer
+// an Knoten des Landstraßennetzes und sind so über Landstraßen verbunden.
+// Alles entsteht beim ersten Zugriff deterministisch aus Seed und Knoten.
+const setlCache = new Map();
+const SETL_KIND = { city: 'Großstadt', town: 'Kleinstadt', village: 'Dorf' };
+const NAME_PRE = ['Ober', 'Unter', 'Neu', 'Alt', 'Groß', 'Klein', 'Hohen', 'Nieder', 'Bad ', 'Sankt '];
+const NAME_MID = ['Linden', 'Eichen', 'Buchen', 'Rosen', 'Wald', 'Stein', 'Mühl', 'Kirch', 'Hasel', 'Birken',
+                  'Wolfs', 'Falken', 'Sonnen', 'Wiesen', 'Brunn', 'Marien', 'Fried', 'Erlen'];
+const NAME_END = ['bach', 'berg', 'feld', 'hausen', 'dorf', 'heim', 'au', 'tal', 'burg', 'stadt', 'hofen',
+                  'furt', 'brück', 'rode', 'weiler'];
+function placeName(i, j, salt) {
+  const pick = (arr, k) => arr[Math.floor(hash(i, j, SEED + salt + k) * arr.length)];
+  let name = pick(NAME_MID, 1) + pick(NAME_END, 2);
+  if (hash(i, j, SEED + salt) < 0.3) {
+    const pre = pick(NAME_PRE, 3);
+    name = pre.endsWith(' ') ? pre + name : pre + name.toLowerCase();
+  }
+  return name;
+}
+
+function cityAt(i, j) {
+  const key = 'c|' + i + '|' + j;
+  let s = setlCache.get(key);
+  if (s !== undefined) return s;
+  s = null;
+  const row = hash(0, j, SEED + 300) < 0.4, col = hash(i, 0, SEED + 301) < 0.4; // wie edgeExists der Autobahnen
+  if ((row && col) || ((row || col) && hash(i, j, SEED + 400) < 0.35)) {
+    const [x, y] = roadNode(0, i, j);
+    s = makeSettlement('city', key, i, j, x, y, 800 + 500 * hash(i, j, SEED + 401), 230);
+  }
+  setlCache.set(key, s);
+  return s;
+}
+function townAt(i, j) {
+  const key = 't|' + i + '|' + j;
+  let s = setlCache.get(key);
+  if (s !== undefined) return s;
+  s = null;
+  const h = hash(i, j, SEED + 410), deg = nodeDegree(1, i, j);
+  const kind = deg >= 3 && h < 0.2 ? 'town' : deg >= 2 && h < 0.5 ? 'village' : null;
+  if (kind) {
+    const [x, y] = roadNode(1, i, j);
+    const R = kind === 'town' ? 300 + 160 * hash(i, j, SEED + 411) : 170 + 80 * hash(i, j, SEED + 411);
+    let ok = true; // nicht in oder dicht an einer Großstadt
+    const ci = Math.floor(x / NETS[0].cell), cj = Math.floor(y / NETS[0].cell);
+    for (let dj = -1; dj <= 1 && ok; dj++) for (let di = -1; di <= 1 && ok; di++) {
+      const c = cityAt(ci + di, cj + dj);
+      if (c && Math.hypot(c.x - x, c.y - y) < c.R * 1.3 + R) ok = false;
+    }
+    if (ok) s = makeSettlement(kind, key, i, j, x, y, R, kind === 'town' ? 190 : 0);
+  }
+  setlCache.set(key, s);
+  return s;
+}
+// Städte bekommen ein achsparalleles Straßenraster; der mittlere Block ist der Platz
+function makeSettlement(kind, key, i, j, x, y, R, sp) {
+  const s = { kind, key, x, y, R, sp, id: Math.floor(hash(i, j, SEED + 420) * 1e6),
+              name: placeName(i, j, kind === 'city' ? 430 : 440), streets: [], buildings: null };
+  if (sp) {
+    for (let k = -Math.ceil(R / sp); k <= Math.ceil(R / sp); k++) {
+      const off = (k + 0.5) * sp, L = Math.sqrt(Math.max(0, R * R - off * off)) - 10;
+      if (L < 60) continue;
+      s.streets.push(straightSeg(key + '|h' + k, x - L, y + off, x + L, y + off, 0, k, kind));
+      s.streets.push(straightSeg(key + '|v' + k, x + off, y - L, x + off, y + L, 1, k, kind));
+    }
+  }
+  return s;
+}
+// Stadtstraßen in Großstädten breit mit Mittellinie, in Kleinstädten schmale Ortsstraßen
+const STREET_DIM = { city: [30, 8], town: [20, 6] };
+function straightSeg(key, x0, y0, x1, y1, dir, idx, kind) {
+  const len = Math.hypot(x1 - x0, y1 - y0), n = Math.ceil(len / 14) + 1, tx = (x1 - x0) / len, ty = (y1 - y0) / len;
+  const xs = new Float32Array(n), ys = new Float32Array(n), nx = new Float32Array(n), ny = new Float32Array(n);
+  for (let q = 0; q < n; q++) {
+    xs[q] = x0 + (x1 - x0) * q / (n - 1); ys[q] = y0 + (y1 - y0) * q / (n - 1);
+    nx[q] = -ty; ny[q] = tx;
+  }
+  const rt = RT.street;
+  const [half, sh] = STREET_DIM[kind];
+  return { key, net: 3, i: dir ? idx : 0, j: dir ? 0 : idx, dir, type: 'street', rank: rt.rank, half,
+           sh, col: rt.col, xs, ys, nx, ny, water: new Uint8Array(n), n, step: len / (n - 1), mtn: false,
+           tunnel: null, tunnels: [], hasWater: false,
+           minx: Math.min(x0, x1), maxx: Math.max(x0, x1), miny: Math.min(y0, y1), maxy: Math.max(y0, y1) };
+}
+
+// Siedlungen, deren erweiterter Umkreis (1.3 R) das Rechteck berührt
+function settlementsNear(x0, y0, x1, y1) {
+  const out = [];
+  const add = s => {
+    if (!s) return;
+    const dx = Math.max(x0 - s.x, 0, s.x - x1), dy = Math.max(y0 - s.y, 0, s.y - y1), m = s.R * 1.3;
+    if (dx * dx + dy * dy < m * m) out.push(s);
+  };
+  const C = NETS[0].cell, T = NETS[1].cell;
+  for (let j = Math.floor(y0 / C) - 1; j <= Math.floor(y1 / C) + 1; j++)
+    for (let i = Math.floor(x0 / C) - 1; i <= Math.floor(x1 / C) + 1; i++) add(cityAt(i, j));
+  for (let j = Math.floor(y0 / T) - 1; j <= Math.floor(y1 / T) + 1; j++)
+    for (let i = Math.floor(x0 / T) - 1; i <= Math.floor(x1 / T) + 1; i++) add(townAt(i, j));
+  return out;
+}
+// Nächste Siedlung relativ zu ihrem Radius: f < 1 heißt innerhalb
+const SQ = { s: null, d: 0, f: 99 };
+function setlQuery(x, y, list) {
+  SQ.s = null; SQ.f = 99;
+  for (const s of list) {
+    const d = Math.hypot(x - s.x, y - s.y), f = d / s.R;
+    if (f < SQ.f) { SQ.f = f; SQ.d = d; SQ.s = s; }
+  }
+  return SQ;
+}
+function urbanGround(s, x, y, cold) {
+  const green = cold ? S_SNOW : S_GRASS;
+  if (s.kind === 'village') return green;
+  const bx = Math.round((x - s.x) / s.sp), by = Math.round((y - s.y) / s.sp);
+  if (bx === 0 && by === 0) return S_URBAN;                                  // Markt- bzw. Stadtplatz
+  if (s.kind === 'town') return green;                                       // Gärten
+  return hash(bx, by, s.id) < 0.1 ? green : S_URBAN;                         // Park oder bebaut
+}
+
+// Gebäude einer Siedlung, beim ersten Bedarf erzeugt
+const CITY_ROOFS = ['#8d9096', '#a3a39e', '#7d828a', '#b5aea2', '#6f7b88', '#9c8f80', '#c0b9ac'];
+function settlementBuildings(s) {
+  if (s.buildings) return s.buildings;
+  const B = s.buildings = [];
+  const rng = mulberry32(s.id * 7 + 13);
+  const views = segsNear(s.x - s.R - 100, s.y - s.R - 100, s.x + s.R + 100, s.y + s.R + 100).filter(v => v.seg.net !== 3);
+  // frei von Straßen (außer dem eigenen Raster) und, wenn gewünscht, von anderen Gebäuden
+  const clearOf = (x, y, w, h, ang, pad, checkOverlap) => {
+    const c = Math.cos(ang), sn = Math.sin(ang);
+    for (const [u, v] of [[0, 0], [-w / 2, -h / 2], [w / 2, -h / 2], [-w / 2, h / 2], [w / 2, h / 2]]) {
+      const R = roadQuery(x + u * c - v * sn, y + u * sn + v * c, views);
+      if (R.seg && R.edge - R.seg.sh < pad) return false;
+    }
+    const r = Math.hypot(w, h) / 2;
+    return !checkOverlap || !B.some(o => Math.hypot(o.x - x, o.y - y) < (o.r + r) * 0.85);
+  };
+  const house = (x, y, w, h, ang) => {
+    const roof = ROOFS[Math.floor(rng() * ROOFS.length)];
+    return { t: 'house', x, y, w, h, ang, r: Math.hypot(w, h) / 2, c1: roof[0], c2: roof[1], chim: rng() };
+  };
+  const tree = (x, y) => { if (clearOf(x, y, 20, 20, 0, 4, true)) B.push(makeTree(rng, x, y)); };
+
+  if (s.kind === 'village') {
+    const rv = views.filter(v => v.seg.net === 1);
+    // Kirche an der Straße nahe dem Ortskern
+    let best = null, bd = Infinity;
+    for (const v of rv) for (let k = v.i0; k <= v.i1; k++) {
+      const d = Math.hypot(v.seg.xs[k] - s.x, v.seg.ys[k] - s.y);
+      if (d < bd) { bd = d; best = [v.seg, k]; }
+    }
+    if (best) {
+      const [g, k] = best, side = rng() < 0.5 ? 1 : -1, w = 64, h = 30, off = g.half + g.sh + h / 2 + 14;
+      const x = g.xs[k] + g.nx[k] * off * side, y = g.ys[k] + g.ny[k] * off * side;
+      const ang = Math.atan2(-g.nx[k], g.ny[k]);
+      if (clearOf(x, y, w, h, ang, 6, true)) B.push({ t: 'church', x, y, w, h, ang, r: Math.hypot(w, h) / 2 });
+    }
+    // Häuser beidseits der Durchgangsstraßen, dahinter Gartenbäume
+    for (const v of rv) {
+      const g = v.seg, stepK = Math.max(1, Math.round(62 / g.step));
+      for (let k = v.i0; k <= v.i1; k += stepK) {
+        if (Math.hypot(g.xs[k] - s.x, g.ys[k] - s.y) > s.R * 0.95) continue;
+        for (const side of [-1, 1]) {
+          if (rng() < 0.2) continue;
+          const w = 30 + rng() * 16, h = 26 + rng() * 12, off = g.half + g.sh + h / 2 + 8 + rng() * 8;
+          const x = g.xs[k] + g.nx[k] * off * side, y = g.ys[k] + g.ny[k] * off * side;
+          const ang = Math.atan2(-g.nx[k], g.ny[k]);
+          if (clearOf(x, y, w, h, ang, 6, true)) B.push(house(x, y, w, h, ang));
+          if (rng() < 0.35) tree(x + g.nx[k] * side * (h / 2 + 22), y + g.ny[k] * side * (h / 2 + 22));
+        }
+      }
+    }
+    return B;
+  }
+
+  const sp = s.sp, K = Math.ceil(s.R / sp);
+  const [sh0, sh1] = STREET_DIM[s.kind];
+  const inner = sp / 2 - (sh0 + sh1) - 6; // halbe Kantenlänge der bebaubaren Blockfläche
+  // Platz: der zentrumsnächste Block, durch den keine Land- oder Autobahn führt
+  let plaza = null;
+  for (const [bx, by] of [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, 1], [1, -1], [-1, -1]]) {
+    const R = roadQuery(s.x + bx * sp, s.y + by * sp, views);
+    if (!R.seg || R.edge - R.seg.sh > inner * 0.5) { plaza = [bx, by]; break; }
+  }
+  for (let by = -K; by <= K; by++) for (let bx = -K; bx <= K; bx++) {
+    const cx = s.x + bx * sp, cy = s.y + by * sp, dc = Math.hypot(cx - s.x, cy - s.y);
+    if (dc > s.R - inner * 1.2) continue;
+    if (plaza && bx === plaza[0] && by === plaza[1]) {
+      if (clearOf(cx, cy, 34, 34, 0, 6, true)) B.push({ t: 'fountain', x: cx, y: cy, r: 16 });
+      for (const [tx, ty] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) tree(cx + tx * inner * 0.7, cy + ty * inner * 0.7);
+      continue;
+    }
+    if (s.kind === 'city') {
+      if (hash(bx, by, s.id) < 0.1) {                                       // Park
+        for (let q = 0; q < 6; q++) tree(cx + (rng() - .5) * inner * 1.6, cy + (rng() - .5) * inner * 1.6);
+        continue;
+      }
+      const lx = rng() < 0.5 ? 1 : 2, ly = rng() < 0.5 ? 1 : 2, lw = inner * 2 / lx, lh = inner * 2 / ly;
+      for (let a = 0; a < lx; a++) for (let b = 0; b < ly; b++) {
+        const x = cx - inner + lw * (a + .5), y = cy - inner + lh * (b + .5), w = lw - 6, h = lh - 6;
+        // zur Mitte hin höher
+        const floors = 2 + Math.floor(rng() * (3 + 9 * Math.max(0, 1 - dc / s.R)));
+        if (clearOf(x, y, w, h, 0, 4, false))
+          B.push({ t: 'bldg', x, y, w, h, ang: 0, r: Math.hypot(w, h) / 2, floors,
+                   c1: CITY_ROOFS[Math.floor(rng() * CITY_ROOFS.length)], det: rng() });
+      }
+    } else {
+      if (plaza && bx === plaza[0] + 1 && by === plaza[1]) {             // Kirche am Marktplatz
+        if (clearOf(cx, cy, 72, 34, 0, 4, false)) B.push({ t: 'church', x: cx, y: cy, w: 72, h: 34, ang: 0, r: 40 });
+        continue;
+      }
+      // je Blockseite zwei Häuser mit der Traufe zur Straße, innen Gärten
+      for (const [nx, ny] of [[0, -1], [0, 1], [-1, 0], [1, 0]]) {
+        for (const along of [-0.45, 0.45]) {
+          if (rng() < 0.15) continue;
+          const w = 30 + rng() * 10, h = 24 + rng() * 6, ang = nx ? Math.PI / 2 : 0;
+          const x = cx + nx * (inner - h / 2) + (ny ? along * inner : 0);
+          const y = cy + ny * (inner - h / 2) + (nx ? along * inner : 0);
+          if (clearOf(x, y, w, h, ang, 4, true)) B.push(house(x, y, w, h, ang));
+        }
+      }
+      if (rng() < 0.7) tree(cx + (rng() - .5) * 16, cy + (rng() - .5) * 16);
+    }
+  }
+  return B;
+}
+
 // ---------- Chunks ----------
 const CELL = 4, CN = 128, CS = CELL * CN; // 512 Welt-Pixel pro Chunk
 const MAX_CHUNKS = 80;
@@ -485,10 +732,11 @@ let spawn = { x: 0, y: 0, a: 0 };
 
 function newChunk(cx, cy) {
   const segs = segsNear(cx * CS, cy * CS, (cx + 1) * CS, (cy + 1) * CS);
-  const s = surfaceAt((cx + .5) * CS, (cy + .5) * CS, segs);
+  const setl = settlementsNear(cx * CS, cy * CS, (cx + 1) * CS, (cy + 1) * CS);
+  const s = surfaceAt((cx + .5) * CS, (cy + .5) * CS, segs, setl);
   const p = SURF[s].rgb;
   return {
-    cx, cy, segs, done: false, row: 0, lastUsed: frameNo,
+    cx, cy, segs, setl, done: false, row: 0, lastUsed: frameNo,
     roofImg: segs.some(v => v.seg.tunnels.length) ? new ImageData(CN, CN) : null, roof: null,
     surf: new Uint8Array(CN * CN), img: new ImageData(CN, CN),
     canvas: null, statics: [], dyn: [],
@@ -502,14 +750,14 @@ function genRows(c, n) {
   for (let j = c.row; j < end; j++) {
     for (let i = 0; i < CN; i++) {
       const wx = ox + (i + .5) * CELL, wy = oy + (j + .5) * CELL;
-      const s = surfaceAt(wx, wy, c.segs);
+      const s = surfaceAt(wx, wy, c.segs, c.setl);
       const idx = j * CN + i;
       c.surf[idx] = s;
       shadeCell(c, s, wx, wy, i, j, d, idx * 4);
       // Tunneldach: dasselbe Gelände, aber ohne Straße
       if (c.roofImg) {
         const rd = c.roofImg.data, o = idx * 4;
-        if (s === S_ASPHALT || s === S_GRAVEL) shadeCell(c, surfaceAt(wx, wy, NO_ROADS), wx, wy, i, j, rd, o);
+        if (s === S_ASPHALT || s === S_GRAVEL) shadeCell(c, surfaceAt(wx, wy, NO_ROADS, c.setl), wx, wy, i, j, rd, o);
         else { rd[o] = d[o]; rd[o + 1] = d[o + 1]; rd[o + 2] = d[o + 2]; rd[o + 3] = 255; }
       }
     }
@@ -548,6 +796,8 @@ function shadeCell(c, s, wx, wy, i, j, d, o) {
     } else {
       g = 76 + 30 * cr.id; r = 30 + 18 * cr.id;
     }
+  } else if (s === S_URBAN) {                     // Gehwegplatten
+    v = (0.95 + 0.05 * n1) * ((Math.floor(wx / 12) + Math.floor(wy / 12)) & 1 ? 0.97 : 1.02);
   } else if (s === S_WHEAT) {                     // Saatreihen quer zur Parzelle
     v *= (Math.floor(lastPW / 12) & 1 ? 0.93 : 1.04) + 0.08 * (n1 - .5);
   } else if (s === S_CORN) {
@@ -560,7 +810,7 @@ function shadeCell(c, s, wx, wy, i, j, d, o) {
   }
   if (lastH > 0.12 && s !== S_SHALLOW && s !== S_DEEP) {
     const hh = lastH; // Hangschattierung, Licht von oben links
-    v *= 1 + clamp((mtnH(wx - 5, wy - 5) - mtnH(wx + 5, wy + 5)) * (s === S_CLIFF ? 11 : 7), -0.5, 0.5);
+    v *= 1 + clamp((mtnH(wx - 5, wy - 5, c.setl) - mtnH(wx + 5, wy + 5, c.setl)) * (s === S_CLIFF ? 11 : 7), -0.5, 0.5);
     lastH = hh;
   }
   d[o] = clamp(r * v, 0, 255); d[o + 1] = clamp(g * v, 0, 255); d[o + 2] = clamp(b * v, 0, 255); d[o + 3] = 255;
@@ -616,6 +866,7 @@ function finalizeChunk(c) {
 // Straßen als Vektorlinien in den Chunk zeichnen. Jedes Segment wird komplett gezeichnet,
 // damit Strichmarkierungen über Chunkgrenzen hinweg nahtlos weiterlaufen.
 const MARK = 'rgba(238,238,228,0.92)';
+const shoulderCol = s => s.type === 'street' ? '#bdb9b0' : '#9a8c74'; // Gehweg bzw. Schotterbankett
 // Unterbrochene Teilstücke bekommen die Lauflänge als Strich-Offset, damit das Strichmuster
 // unabhängig von Lücken (und damit in jedem Chunk gleich) weiterläuft.
 function polyLine(g, s, off, w, col, dash, pred) {
@@ -679,6 +930,10 @@ function drawMarkings(g, s, p) {
     polyLine(g, s, 0, 1.8, MARK, [20, 22], p);
     polyLine(g, s, -(LANE + 1), 1.8, MARK, null, p);
     polyLine(g, s, LANE + 1, 1.8, MARK, null, p);
+  } else if (s.type === 'street') {
+    if (h > 25) polyLine(g, s, 0, 1.5, 'rgba(238,238,228,0.7)', [14, 18], p);
+    polyLine(g, s, -h, 1.5, '#8b877f', null, p);                      // Bordsteine
+    polyLine(g, s, h, 1.5, '#8b877f', null, p);
   } else if (s.type === 'track') {
     polyLine(g, s, 0, 5, 'rgba(96,128,62,0.55)', null, p);            // Grasnarbe in der Mitte
     polyLine(g, s, -11, 5, 'rgba(110,90,60,0.5)', null, p);           // Fahrspuren
@@ -698,7 +953,7 @@ function drawRoads(c) {
   g.lineJoin = 'round';
   const segs = c.segs.map(v => v.seg);
   const wetPred = s => k => s.water[k] || s.water[k - 1] || s.water[k + 1];
-  for (const net of [2, 1, 0]) {
+  for (const net of [2, 3, 1, 0]) {
     const list = segs.filter(s => s.net === net);
     g.lineCap = 'butt';
     for (const s of list) if (s.hasWater) {
@@ -708,7 +963,7 @@ function drawRoads(c) {
     }
     g.lineCap = 'round';
     for (const s of list) {
-      if (s.sh) polyLine(g, s, 0, (s.half + s.sh) * 2, '#9a8c74', null, k => !s.water[k]);
+      if (s.sh) polyLine(g, s, 0, (s.half + s.sh) * 2, shoulderCol(s), null, k => !s.water[k]);
       else polyLine(g, s, 0, s.half * 2 + 6, 'rgba(84,66,42,0.35)');
     }
     for (const s of list) polyLine(g, s, 0, s.half * 2, s.col);
@@ -758,6 +1013,7 @@ function genObstacles(c) {
 
   for (let k = 0; k < 70; k++) {
     const x = ox + rng() * CS, y = oy + rng() * CS;
+    if (c.setl.length && setlQuery(x, y, c.setl).f < 1.08) continue;
     const s = localSurf(c, x, y);
     const r = rng();
     const forest = forestAt(x, y);
@@ -805,6 +1061,10 @@ function genObstacles(c) {
       }
     }
     if (o && free(o.x, o.y, o.r)) S.push(o);
+  }
+  // Gebäude der Siedlungen gehören dem Chunk, in dem ihr Mittelpunkt liegt
+  for (const st of c.setl) for (const b of settlementBuildings(st)) {
+    if (b.x >= ox && b.x < ox + CS && b.y >= oy && b.y < oy + CS) S.push(b);
   }
 }
 
@@ -1083,18 +1343,18 @@ function collide() {
     const px = car.x + fx * off, py = car.y + fy * off;
 
     for (const o of nearStatics) {
-      if (o.t === 'house') {
-        const qx = clamp(px, o.x - o.w / 2, o.x + o.w / 2), qy = clamp(py, o.y - o.h / 2, o.y + o.h / 2);
-        let dx = px - qx, dy = py - qy, d = Math.hypot(dx, dy);
+      if (o.w) { // Gebäude: Rechteck, ggf. gedreht – Rechnung im lokalen System
+        const c = Math.cos(o.ang || 0), sn = Math.sin(o.ang || 0);
+        const lx = (px - o.x) * c + (py - o.y) * sn, ly = -(px - o.x) * sn + (py - o.y) * c;
+        const qx = clamp(lx, -o.w / 2, o.w / 2), qy = clamp(ly, -o.h / 2, o.h / 2);
+        let dx = lx - qx, dy = ly - qy, d = Math.hypot(dx, dy), pen = CR - d;
         if (d >= CR) continue;
-        if (d < 1e-4) { // Mittelpunkt im Haus: über die nächste Kante hinausschieben
-          const l = px - (o.x - o.w / 2), r = (o.x + o.w / 2) - px, t = py - (o.y - o.h / 2), b = (o.y + o.h / 2) - py;
-          const m = Math.min(l, r, t, b);
-          if (m === l) resolveStatic(px, py, -1, 0, l + CR, .3);
-          else if (m === r) resolveStatic(px, py, 1, 0, r + CR, .3);
-          else if (m === t) resolveStatic(px, py, 0, -1, t + CR, .3);
-          else resolveStatic(px, py, 0, 1, b + CR, .3);
-        } else resolveStatic(px, py, dx / d, dy / d, CR - d, .3);
+        if (d < 1e-4) { // Mittelpunkt im Gebäude: über die nächste Kante hinausschieben
+          const l = lx + o.w / 2, r = o.w / 2 - lx, t = ly + o.h / 2, b = o.h / 2 - ly, m = Math.min(l, r, t, b);
+          [dx, dy] = m === l ? [-1, 0] : m === r ? [1, 0] : m === t ? [0, -1] : [0, 1];
+          d = 1; pen = m + CR;
+        }
+        resolveStatic(px, py, (dx * c - dy * sn) / d, (dx * sn + dy * c) / d, pen, .3);
       } else {
         const rr = o.t === 'tree' || o.t === 'pine' ? o.r * 0.7 : o.t === 'bush' ? o.r * 0.8 : o.r * 0.9;
         const dx = px - o.x, dy = py - o.y, d = Math.hypot(dx, dy), md = CR + rr;
@@ -1155,7 +1415,7 @@ function updateDyn(dt) {
         o.vx *= f; o.vy *= f; o.va *= Math.exp(-2 * dt);
       }
       for (const s of c.statics) {
-        if (s.t === 'house') continue;
+        if (s.w) continue;
         const ddx = o.x - s.x, ddy = o.y - s.y, d = Math.hypot(ddx, ddy), md = o.r + s.r * 0.75;
         if (d < md && d > 1e-4) {
           const nx = ddx / d, ny = ddy / d;
@@ -1328,14 +1588,27 @@ function updateCamera(dt) {
 }
 
 // ---------- Zeichnen ----------
-const SHADOW_H = { tree: 8, pine: 9, cactus: 5, bush: 3, rock: 3, stump: 2, cone: 2, barrel: 3, crate: 3, bale: 4, sheep: 3, cow: 4 };
-const HIGH = { tree: 1, pine: 1, house: 1, cactus: 1 };
+const SHADOW_H = { fountain: 2, tree: 8, pine: 9, cactus: 5, bush: 3, rock: 3, stump: 2, cone: 2, barrel: 3, crate: 3, bale: 4, sheep: 3, cow: 4 };
+const HIGH = { tree: 1, pine: 1, house: 1, cactus: 1, bldg: 1, church: 1 };
 
 function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill(); }
 
 function drawShadow(o) {
   ctx.fillStyle = 'rgba(0,0,0,0.22)';
-  if (o.t === 'house') { ctx.fillRect(o.x - o.w / 2 + 8, o.y - o.h / 2 + 10, o.w, o.h); return; }
+  if (o.w) {
+    // Schatten als Extrusion des Grundrisses: höhere Gebäude werfen längere Schatten
+    const off = o.t === 'bldg' ? 4 + o.floors * 2.4 : o.t === 'church' ? 11 : 8;
+    ctx.save(); ctx.translate(o.x, o.y);
+    ctx.beginPath();
+    for (let q = 0; q <= 4; q++) {
+      const ox = off * q / 4, oy = off * 1.25 * q / 4;
+      ctx.save(); ctx.translate(ox, oy); ctx.rotate(o.ang || 0);
+      ctx.rect(-o.w / 2, -o.h / 2, o.w, o.h);
+      ctx.restore();
+    }
+    ctx.fill(); ctx.restore();
+    return;
+  }
   const h = SHADOW_H[o.t] || 3;
   ctx.beginPath(); ctx.ellipse(o.x + h, o.y + h * 1.3, o.r, o.r * 0.95, 0, 0, TAU); ctx.fill();
 }
@@ -1405,21 +1678,61 @@ function drawStatic(o) {
       break;
     }
     case 'house': {
-      const x0 = o.x - o.w / 2, y0 = o.y - o.h / 2;
-      if (o.w >= o.h) {
-        ctx.fillStyle = o.c1; ctx.fillRect(x0, y0, o.w, o.h / 2);
-        ctx.fillStyle = o.c2; ctx.fillRect(x0, o.y, o.w, o.h / 2);
+      ctx.save(); ctx.translate(o.x, o.y); ctx.rotate(o.ang || 0);
+      const w = o.w, h = o.h;
+      if (w >= h) {
+        ctx.fillStyle = o.c1; ctx.fillRect(-w / 2, -h / 2, w, h / 2);
+        ctx.fillStyle = o.c2; ctx.fillRect(-w / 2, 0, w, h / 2);
       } else {
-        ctx.fillStyle = o.c1; ctx.fillRect(x0, y0, o.w / 2, o.h);
-        ctx.fillStyle = o.c2; ctx.fillRect(o.x, y0, o.w / 2, o.h);
+        ctx.fillStyle = o.c1; ctx.fillRect(-w / 2, -h / 2, w / 2, h);
+        ctx.fillStyle = o.c2; ctx.fillRect(0, -h / 2, w / 2, h);
       }
       ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.lineWidth = 2;
       ctx.beginPath();
-      if (o.w >= o.h) { ctx.moveTo(x0, o.y); ctx.lineTo(x0 + o.w, o.y); } else { ctx.moveTo(o.x, y0); ctx.lineTo(o.x, y0 + o.h); }
+      if (w >= h) { ctx.moveTo(-w / 2, 0); ctx.lineTo(w / 2, 0); } else { ctx.moveTo(0, -h / 2); ctx.lineTo(0, h / 2); }
       ctx.stroke();
-      ctx.strokeRect(x0, y0, o.w, o.h);
+      ctx.strokeRect(-w / 2, -h / 2, w, h);
       ctx.fillStyle = '#6d5e55';
-      ctx.fillRect(o.x + (o.chim - .5) * o.w * .6 - 4, o.y - o.h * .3 - 4, 8, 8);
+      ctx.fillRect((o.chim - .5) * w * .6 - 4, -h * .3 - 4, 8, 8);
+      ctx.restore();
+      break;
+    }
+    case 'bldg': {                                   // Flachdach mit Aufbauten
+      ctx.save(); ctx.translate(o.x, o.y); ctx.rotate(o.ang || 0);
+      const w = o.w, h = o.h;
+      ctx.fillStyle = o.c1; ctx.fillRect(-w / 2, -h / 2, w, h);
+      ctx.fillStyle = 'rgba(255,255,255,0.16)'; ctx.fillRect(-w / 2, -h / 2, w, 3); ctx.fillRect(-w / 2, -h / 2, 3, h);
+      ctx.strokeStyle = 'rgba(0,0,0,0.3)'; ctx.lineWidth = 2; ctx.strokeRect(-w / 2 + 1, -h / 2 + 1, w - 2, h - 2);
+      ctx.fillStyle = 'rgba(0,0,0,0.12)'; ctx.fillRect(-w / 2 + 5, -h / 2 + 5, w - 10, h - 10);
+      ctx.fillStyle = '#5c6168'; ctx.fillRect(-w / 2 + 6 + (w - 24) * o.det, -h / 2 + 6 + (h - 22) * (1 - o.det), 12, 10);
+      if (o.floors > 10) {                            // Hubschrauberlandeplatz auf Hochhäusern
+        ctx.strokeStyle = '#e9e6dc'; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(0, 0, Math.min(w, h) * 0.22, 0, TAU); ctx.stroke();
+      }
+      ctx.restore();
+      break;
+    }
+    case 'church': {                                 // Kirchenschiff mit Turm an der Stirnseite
+      ctx.save(); ctx.translate(o.x, o.y); ctx.rotate(o.ang || 0);
+      const w = o.w, h = o.h, tw = h * 0.95;
+      ctx.fillStyle = '#9c4a3a'; ctx.fillRect(-w / 2, -h / 2, w - tw, h / 2);
+      ctx.fillStyle = '#7c3a2d'; ctx.fillRect(-w / 2, 0, w - tw, h / 2);
+      ctx.strokeStyle = 'rgba(0,0,0,0.3)'; ctx.lineWidth = 2; ctx.strokeRect(-w / 2, -h / 2, w - tw, h);
+      const tx = w / 2 - tw / 2;
+      ctx.fillStyle = '#7e8a86'; ctx.fillRect(tx - tw / 2, -tw / 2, tw, tw);
+      ctx.strokeStyle = '#5c6663'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(tx - tw / 2, -tw / 2); ctx.lineTo(tx + tw / 2, tw / 2);
+      ctx.moveTo(tx + tw / 2, -tw / 2); ctx.lineTo(tx - tw / 2, tw / 2); ctx.stroke();
+      ctx.strokeRect(tx - tw / 2, -tw / 2, tw, tw);
+      ctx.fillStyle = '#d8c26a'; ctx.fillRect(tx - 1, -5, 2, 10); ctx.fillRect(tx - 4, -2, 8, 2);
+      ctx.restore();
+      break;
+    }
+    case 'fountain': {
+      ctx.fillStyle = '#b9b2a4'; circle(o.x, o.y, o.r);
+      ctx.fillStyle = '#6fa9d6'; circle(o.x, o.y, o.r * 0.78);
+      ctx.fillStyle = 'rgba(255,255,255,0.35)'; circle(o.x - o.r * .25, o.y - o.r * .25, o.r * .25);
+      ctx.fillStyle = '#d9d4c8'; circle(o.x, o.y, o.r * 0.22);
       break;
     }
   }
@@ -1488,7 +1801,7 @@ function drawDeck(z) {
   ctx.restore();
   // Auffahrten neu zeichnen, damit der Schatten nicht auf die eigene Straße fällt
   const ramps = segs.map(s => k => { const d = Math.hypot(s.xs[k] - z.x, s.ys[k] - z.y); return d > z.span - 16 && d < z.span + 40; });
-  segs.forEach((s, i) => { if (s.sh) polyLine(ctx, s, 0, (s.half + s.sh) * 2, '#9a8c74', null, ramps[i]); });
+  segs.forEach((s, i) => { if (s.sh) polyLine(ctx, s, 0, (s.half + s.sh) * 2, shoulderCol(s), null, ramps[i]); });
   segs.forEach((s, i) => polyLine(ctx, s, 0, s.half * 2, s.col, null, ramps[i]));
   segs.forEach((s, i) => drawMarkings(ctx, s, ramps[i]));
   segs.forEach((s, i) => polyLine(ctx, s, 0, (s.half + 4) * 2, '#8b8e94', null, preds[i])); // Brückenkante (Beton)
@@ -1632,12 +1945,14 @@ mapShown.width = mapShown.height = MAP_N;
 let mapRow = 0, mapCX = 0, mapCY = 0, shownCX = 0, shownCY = 0, mapReady = false;
 
 let mapRoads = [];
-const MAP_ROAD_STYLE = { track: [1, '#7d6444'], lane: [1.5, '#d6d6cf'], road: [2, '#f4f4ef'], hw: [3.5, '#f2c14e'] };
+let mapPlaces = [];
+const MAP_ROAD_STYLE = { street: [1.2, '#e3e1da'], track: [1, '#7d6444'], lane: [1.5, '#d6d6cf'], road: [2, '#f4f4ef'], hw: [3.5, '#f2c14e'] };
 
 function mapWork(rows) {
   if (mapRow === 0) {
     mapCX = car.x; mapCY = car.y;
     mapRoads = segsNear(car.x - MAP_R - 300, car.y - MAP_R - 300, car.x + MAP_R + 300, car.y + MAP_R + 300);
+    mapPlaces = settlementsNear(car.x - MAP_R, car.y - MAP_R, car.x + MAP_R, car.y + MAP_R).filter(s => s.kind !== 'village');
   }
   const d = mapBuf.data;
   for (let n = 0; n < rows && mapRow < MAP_N; n++, mapRow++) {
@@ -1675,6 +1990,13 @@ function drawMap() {
     mctx.lineTo((s.xs[v.i1] - car.x) * k + S / 2, (s.ys[v.i1] - car.y) * k + S / 2);
     mctx.stroke();
   }
+  mctx.textAlign = 'center'; mctx.textBaseline = 'middle';
+  for (const s of mapPlaces) {
+    const x = (s.x - car.x) * k + S / 2, y = (s.y - car.y) * k + S / 2;
+    mctx.font = s.kind === 'city' ? '700 11px system-ui, sans-serif' : '600 9px system-ui, sans-serif';
+    mctx.lineWidth = 3; mctx.strokeStyle = 'rgba(20,22,28,0.85)'; mctx.strokeText(s.name, x, y);
+    mctx.fillStyle = '#fff'; mctx.fillText(s.name, x, y);
+  }
   mctx.save(); mctx.translate(S / 2, S / 2); mctx.rotate(car.a);
   mctx.fillStyle = CAR_COLORS[car.color]; mctx.strokeStyle = '#000'; mctx.lineWidth = 1.5;
   mctx.beginPath(); mctx.moveTo(8, 0); mctx.lineTo(-6, -5.5); mctx.lineTo(-3, 0); mctx.lineTo(-6, 5.5); mctx.closePath();
@@ -1685,6 +2007,7 @@ function drawMap() {
 // ---------- HUD ----------
 const elSpd = document.getElementById('spd'), elGear = document.getElementById('gear');
 const elSurf = document.getElementById('surfName'), elSw = document.getElementById('swatch');
+const elPlace = document.getElementById('place');
 let hudName = '';
 function updateHud() {
   elSpd.textContent = Math.round(Math.abs(car.vf) * KMH);
@@ -1703,6 +2026,9 @@ function updateHud() {
     name = (road.mtn && road.net === 1 ? 'Gebirgsstraße' : RT[road.type].name) + extra;
     col = road.type === 'track' ? SURF[S_GRAVEL].rgb : [86, 88, 94];
   }
+  const P = setlQuery(car.x, car.y, settlementsNear(car.x, car.y, car.x, car.y));
+  const place = P.s && P.f < 1 ? SETL_KIND[P.s.kind] + ' ' + P.s.name : '';
+  if (elPlace.textContent !== place) elPlace.textContent = place;
   if (name !== hudName) {
     hudName = name;
     elSurf.textContent = name;
@@ -1739,6 +2065,7 @@ function newWorld(seed) {
   chunks.clear();
   segCache.clear();
   crossCache.clear();
+  setlCache.clear();
   allCrossings.length = 0;
   car.zone = null; car.upper = false;
   particles.length = 0;
