@@ -341,7 +341,7 @@ function segsNear(x0, y0, x1, y1) {
       }
     }
   }
-  for (const st of settlementsNear(x0, y0, x1, y1)) for (const s of st.streets) push(s);
+  for (const st of settlementsNear(x0, y0, x1, y1)) for (const s of streetsOf(st)) push(s);
   out.sort((a, b) => b.seg.net - a.seg.net || (a.seg.key < b.seg.key ? -1 : a.seg.key > b.seg.key ? 1 : 0));
   return out;
 }
@@ -524,7 +524,7 @@ function cityAt(i, j) {
   const row = hash(0, j, SEED + 300) < 0.4, col = hash(i, 0, SEED + 301) < 0.4; // wie edgeExists der Autobahnen
   if ((row && col) || ((row || col) && hash(i, j, SEED + 400) < 0.35)) {
     const [x, y] = roadNode(0, i, j);
-    s = makeSettlement('city', key, i, j, x, y, 800 + 500 * hash(i, j, SEED + 401), 230);
+    s = makeSettlement('city', key, i, j, x, y, 800 + 500 * hash(i, j, SEED + 401));
   }
   setlCache.set(key, s);
   return s;
@@ -538,47 +538,143 @@ function townAt(i, j) {
   const kind = deg >= 3 && h < 0.2 ? 'town' : deg >= 2 && h < 0.5 ? 'village' : null;
   if (kind) {
     const [x, y] = roadNode(1, i, j);
-    const R = kind === 'town' ? 300 + 160 * hash(i, j, SEED + 411) : 170 + 80 * hash(i, j, SEED + 411);
+    const R = kind === 'town' ? 320 + 160 * hash(i, j, SEED + 411) : 180 + 90 * hash(i, j, SEED + 411);
     let ok = true; // nicht in oder dicht an einer Großstadt
     const ci = Math.floor(x / NETS[0].cell), cj = Math.floor(y / NETS[0].cell);
     for (let dj = -1; dj <= 1 && ok; dj++) for (let di = -1; di <= 1 && ok; di++) {
       const c = cityAt(ci + di, cj + dj);
       if (c && Math.hypot(c.x - x, c.y - y) < c.R * 1.3 + R) ok = false;
     }
-    if (ok) s = makeSettlement(kind, key, i, j, x, y, R, kind === 'town' ? 190 : 0);
+    if (ok) s = makeSettlement(kind, key, i, j, x, y, R);
   }
   setlCache.set(key, s);
   return s;
 }
-// Städte bekommen ein achsparalleles Straßenraster; der mittlere Block ist der Platz
-function makeSettlement(kind, key, i, j, x, y, R, sp) {
-  const s = { kind, key, x, y, R, sp, id: Math.floor(hash(i, j, SEED + 420) * 1e6),
-              name: placeName(i, j, kind === 'city' ? 430 : 440), streets: [], buildings: null };
-  if (sp) {
-    for (let k = -Math.ceil(R / sp); k <= Math.ceil(R / sp); k++) {
-      const off = (k + 0.5) * sp, L = Math.sqrt(Math.max(0, R * R - off * off)) - 10;
-      if (L < 60) continue;
-      s.streets.push(straightSeg(key + '|h' + k, x - L, y + off, x + L, y + off, 0, k, kind));
-      s.streets.push(straightSeg(key + '|v' + k, x + off, y - L, x + off, y + L, 1, k, kind));
-    }
-  }
+function makeSettlement(kind, key, i, j, x, y, R) {
+  const s = { kind, key, node: [i, j], x, y, R, id: Math.floor(hash(i, j, SEED + 420) * 1e6),
+              name: placeName(i, j, kind === 'city' ? 430 : 440), streets: null, buildings: null };
+  if (kind === 'city') cityGrid(s);
   return s;
 }
-// Stadtstraßen in Großstädten breit mit Mittellinie, in Kleinstädten schmale Ortsstraßen
-const STREET_DIM = { city: [30, 8], town: [20, 6] };
-function straightSeg(key, x0, y0, x1, y1, dir, idx, kind) {
-  const len = Math.hypot(x1 - x0, y1 - y0), n = Math.ceil(len / 14) + 1, tx = (x1 - x0) / len, ty = (y1 - y0) / len;
-  const xs = new Float32Array(n), ys = new Float32Array(n), nx = new Float32Array(n), ny = new Float32Array(n);
+
+// Halbe Fahrbahnbreite und Gehweg/Bankett je Straßenart
+const STREET_DIM = { city: [30, 8], avenue: [40, 10], town: [18, 5], village: [16, 3] };
+function polySeg(key, xs, ys, dir, idx, kind) {
+  const n = xs.length, X = Float32Array.from(xs), Y = Float32Array.from(ys);
+  const nx = new Float32Array(n), ny = new Float32Array(n);
+  let len = 0, minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
   for (let q = 0; q < n; q++) {
-    xs[q] = x0 + (x1 - x0) * q / (n - 1); ys[q] = y0 + (y1 - y0) * q / (n - 1);
-    nx[q] = -ty; ny[q] = tx;
+    const a = Math.max(0, q - 1), b = Math.min(n - 1, q + 1);
+    const tx = X[b] - X[a], ty = Y[b] - Y[a], l = Math.hypot(tx, ty) || 1;
+    nx[q] = -ty / l; ny[q] = tx / l;
+    if (q) len += Math.hypot(X[q] - X[q - 1], Y[q] - Y[q - 1]);
+    minx = Math.min(minx, X[q]); maxx = Math.max(maxx, X[q]); miny = Math.min(miny, Y[q]); maxy = Math.max(maxy, Y[q]);
   }
-  const rt = RT.street;
-  const [half, sh] = STREET_DIM[kind];
-  return { key, net: 3, i: dir ? idx : 0, j: dir ? 0 : idx, dir, type: 'street', rank: rt.rank, half,
-           sh, col: rt.col, xs, ys, nx, ny, water: new Uint8Array(n), n, step: len / (n - 1), mtn: false,
-           tunnel: null, tunnels: [], hasWater: false,
-           minx: Math.min(x0, x1), maxx: Math.max(x0, x1), miny: Math.min(y0, y1), maxy: Math.max(y0, y1) };
+  const [half, sh] = STREET_DIM[kind], rt = RT.street;
+  return { key, net: 3, i: dir ? idx : 0, j: dir ? 0 : idx, dir, type: 'street', skind: kind, rank: rt.rank,
+           half, sh, col: rt.col, xs: X, ys: Y, nx, ny, water: new Uint8Array(n), n, step: len / (n - 1),
+           mtn: false, tunnel: null, tunnels: [], hasWater: false, minx, maxx, miny, maxy };
+}
+function straightSeg(key, x0, y0, x1, y1, dir, idx, kind) {
+  const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 14) + 1, xs = [], ys = [];
+  for (let q = 0; q < n; q++) { xs.push(x0 + (x1 - x0) * q / (n - 1)); ys.push(y0 + (y1 - y0) * q / (n - 1)); }
+  return polySeg(key, xs, ys, dir, idx, kind);
+}
+
+// Großstadt: leicht gedrehtes, unregelmäßiges Raster mit wechselnden Blockgrößen; einzelne
+// Straßenstücke fehlen (größere Blöcke, T-Kreuzungen), dazu Diagonalavenuen durchs Zentrum
+function cityGrid(s) {
+  const rng = mulberry32(s.id * 3 + 1);
+  s.ang = (rng() - 0.5) * 0.7;
+  const c = Math.cos(s.ang), sn = Math.sin(s.ang);
+  s.toWorld = (u, v) => [s.x + u * c - v * sn, s.y + u * sn + v * c];
+  s.toLocal = (x, y) => [(x - s.x) * c + (y - s.y) * sn, -(x - s.x) * sn + (y - s.y) * c];
+  const lines = () => { const L = []; for (let p = -s.R - rng() * 150; p < s.R; p += 190 + rng() * 120) L.push(p); return L; };
+  s.U = lines(); s.V = lines();
+  s.streets = [];
+  for (let axis = 0; axis < 2; axis++) {
+    const A = axis ? s.V : s.U, B = axis ? s.U : s.V;
+    A.forEach((a, k) => {
+      const L = Math.sqrt(Math.max(0, s.R * s.R - a * a)) - 10;
+      if (L < 60) return;
+      const cuts = [-L, ...B.filter(b => b > -L + 30 && b < L - 30), L];
+      const pt = t => axis ? s.toWorld(t, a) : s.toWorld(a, t);
+      let start = null;
+      for (let m = 0; m < cuts.length - 1; m++) {
+        const keep = Math.abs(a) < s.R * 0.2 || rng() > 0.2;
+        if (keep && start === null) start = cuts[m];
+        if (start !== null && (!keep || m === cuts.length - 2)) {
+          const end = keep ? cuts[m + 1] : cuts[m];
+          if (end - start > 50) {
+            const [x0, y0] = pt(start), [x1, y1] = pt(end);
+            s.streets.push(straightSeg(s.key + '|' + axis + '|' + k + '|' + m, x0, y0, x1, y1, axis, k, 'city'));
+          }
+          start = null;
+        }
+      }
+    });
+  }
+  const nAv = rng() < 0.5 ? 2 : 1;
+  for (let q = 0; q < nAv; q++) {
+    const a = s.ang + Math.PI / 4 + q * Math.PI / 2, L = s.R - 20;
+    s.streets.push(straightSeg(s.key + '|av' + q, s.x - Math.cos(a) * L, s.y - Math.sin(a) * L,
+                               s.x + Math.cos(a) * L, s.y + Math.sin(a) * L, 2, 100 + q, 'avenue'));
+  }
+}
+
+function streetsOf(s) {
+  if (!s.streets) { s.streets = []; organicStreets(s); } // erst setzen: schützt vor Rekursion
+  return s.streets;
+}
+// Dorf und Kleinstadt: leicht gebogene Seitenstraßen zweigen von den Durchgangsstraßen ab,
+// in Kleinstädten verzweigen sie sich ein weiteres Mal
+function organicStreets(s) {
+  const rng = mulberry32(s.id * 5 + 3);
+  const [i, j] = s.node, town = s.kind === 'town';
+  const inc = [];
+  for (const [si, sj, dir, atStart] of [[i, j, 0, true], [i - 1, j, 0, false], [i, j, 1, true], [i, j - 1, 1, false]]) {
+    const g = getSeg(1, si, sj, dir);
+    if (g) inc.push([g, atStart]);
+  }
+  if (!inc.length) return;
+  let id = 0;
+  const tooClose = (x, y) => {
+    for (const [g] of inc) for (let k = 0; k < g.n; k += 2)
+      if (Math.hypot(g.xs[k] - x, g.ys[k] - y) < g.half + 34) return true;
+    for (const o of s.streets) for (let k = 0; k < o.n; k += 2)
+      if (Math.hypot(o.xs[k] - x, o.ys[k] - y) < o.half * 2 + 44) return true;
+    return false;
+  };
+  const branch = (x0, y0, dx, dy, len, level) => {
+    while (len > 60 && Math.hypot(x0 + dx * len - s.x, y0 + dy * len - s.y) > s.R * 1.05) len *= 0.85;
+    if (len < 70) return;
+    const bend = (rng() - 0.5) * len * 0.5, n0 = Math.ceil(len / 14) + 1, xs = [], ys = [];
+    for (let q = 0; q < n0; q++) {
+      const t = q / (n0 - 1), b = bend * 4 * t * (1 - t);
+      const x = x0 + dx * len * t - dy * b, y = y0 + dy * len * t + dx * b;
+      // endet vor anderen Straßen, damit sich Seitenstraßen nicht verknäueln
+      if (q * 14 > 100 && tooClose(x, y)) break;
+      xs.push(x); ys.push(y);
+    }
+    const n = xs.length;
+    if (n * 14 < 80) return;
+    const seg = polySeg(s.key + '|b' + id, xs, ys, 2 + level, ++id, s.kind);
+    s.streets.push(seg);
+    if (town && level === 0) {
+      for (let b = Math.floor(rng() * 3); b > 0; b--) {
+        const k = Math.floor(n * (0.35 + rng() * 0.5)), side = rng() < 0.5 ? 1 : -1;
+        const a = Math.atan2(seg.ny[k] * side, seg.nx[k] * side) + (rng() - .5) * 0.5;
+        branch(seg.xs[k], seg.ys[k], Math.cos(a), Math.sin(a), len * (0.4 + rng() * 0.3), 1);
+      }
+    }
+  };
+  for (let b = town ? 4 + Math.floor(rng() * 3) : 1 + Math.floor(rng() * 3); b > 0; b--) {
+    const [g, atStart] = inc[Math.floor(rng() * inc.length)];
+    const dk = Math.round((50 + rng() * s.R * 0.7) / g.step);
+    const k = clamp(atStart ? dk : g.n - 1 - dk, 1, g.n - 2), side = rng() < 0.5 ? 1 : -1;
+    const a = Math.atan2(g.ny[k] * side, g.nx[k] * side) + (rng() - .5) * 0.7;
+    branch(g.xs[k], g.ys[k], Math.cos(a), Math.sin(a), s.R * (0.45 + rng() * 0.5), 0);
+  }
 }
 
 // Siedlungen, deren erweiterter Umkreis (1.3 R) das Rechteck berührt
@@ -606,13 +702,19 @@ function setlQuery(x, y, list) {
   }
   return SQ;
 }
+function cityCell(s, x, y) {
+  const [u, v] = s.toLocal(x, y);
+  let a = -1, b = -1;
+  for (const p of s.U) if (p <= u) a++;
+  for (const p of s.V) if (p <= v) b++;
+  return [a, b];
+}
 function urbanGround(s, x, y, cold) {
   const green = cold ? S_SNOW : S_GRASS;
+  if (s.kind === 'town') return Math.hypot(x - s.x, y - s.y) < 75 ? S_URBAN : green; // Marktplatz
   if (s.kind === 'village') return green;
-  const bx = Math.round((x - s.x) / s.sp), by = Math.round((y - s.y) / s.sp);
-  if (bx === 0 && by === 0) return S_URBAN;                                  // Markt- bzw. Stadtplatz
-  if (s.kind === 'town') return green;                                       // Gärten
-  return hash(bx, by, s.id) < 0.1 ? green : S_URBAN;                         // Park oder bebaut
+  const [a, b] = cityCell(s, x, y);
+  return hash(a, b, s.id) < 0.1 ? green : S_URBAN;                                   // Park oder bebaut
 }
 
 // Gebäude einer Siedlung, beim ersten Bedarf erzeugt
@@ -621,8 +723,8 @@ function settlementBuildings(s) {
   if (s.buildings) return s.buildings;
   const B = s.buildings = [];
   const rng = mulberry32(s.id * 7 + 13);
-  const views = segsNear(s.x - s.R - 100, s.y - s.R - 100, s.x + s.R + 100, s.y + s.R + 100).filter(v => v.seg.net !== 3);
-  // frei von Straßen (außer dem eigenen Raster) und, wenn gewünscht, von anderen Gebäuden
+  const views = segsNear(s.x - s.R - 100, s.y - s.R - 100, s.x + s.R + 100, s.y + s.R + 100);
+  // frei von Straßen und, wenn gewünscht, von anderen Gebäuden
   const clearOf = (x, y, w, h, ang, pad, checkOverlap) => {
     const c = Math.cos(ang), sn = Math.sin(ang);
     for (const [u, v] of [[0, 0], [-w / 2, -h / 2], [w / 2, -h / 2], [-w / 2, h / 2], [w / 2, h / 2]]) {
@@ -632,94 +734,93 @@ function settlementBuildings(s) {
     const r = Math.hypot(w, h) / 2;
     return !checkOverlap || !B.some(o => Math.hypot(o.x - x, o.y - y) < (o.r + r) * 0.85);
   };
-  const house = (x, y, w, h, ang) => {
-    const roof = ROOFS[Math.floor(rng() * ROOFS.length)];
-    return { t: 'house', x, y, w, h, ang, r: Math.hypot(w, h) / 2, c1: roof[0], c2: roof[1], chim: rng() };
-  };
   const tree = (x, y) => { if (clearOf(x, y, 20, 20, 0, 4, true)) B.push(makeTree(rng, x, y)); };
-
-  if (s.kind === 'village') {
-    const rv = views.filter(v => v.seg.net === 1);
-    // Kirche an der Straße nahe dem Ortskern
-    let best = null, bd = Infinity;
-    for (const v of rv) for (let k = v.i0; k <= v.i1; k++) {
-      const d = Math.hypot(v.seg.xs[k] - s.x, v.seg.ys[k] - s.y);
-      if (d < bd) { bd = d; best = [v.seg, k]; }
-    }
-    if (best) {
-      const [g, k] = best, side = rng() < 0.5 ? 1 : -1, w = 64, h = 30, off = g.half + g.sh + h / 2 + 14;
-      const x = g.xs[k] + g.nx[k] * off * side, y = g.ys[k] + g.ny[k] * off * side;
-      const ang = Math.atan2(-g.nx[k], g.ny[k]);
-      if (clearOf(x, y, w, h, ang, 6, true)) B.push({ t: 'church', x, y, w, h, ang, r: Math.hypot(w, h) / 2 });
-    }
-    // Häuser beidseits der Durchgangsstraßen, dahinter Gartenbäume
-    for (const v of rv) {
-      const g = v.seg, stepK = Math.max(1, Math.round(62 / g.step));
-      for (let k = v.i0; k <= v.i1; k += stepK) {
-        if (Math.hypot(g.xs[k] - s.x, g.ys[k] - s.y) > s.R * 0.95) continue;
-        for (const side of [-1, 1]) {
-          if (rng() < 0.2) continue;
-          const w = 30 + rng() * 16, h = 26 + rng() * 12, off = g.half + g.sh + h / 2 + 8 + rng() * 8;
-          const x = g.xs[k] + g.nx[k] * off * side, y = g.ys[k] + g.ny[k] * off * side;
-          const ang = Math.atan2(-g.nx[k], g.ny[k]);
-          if (clearOf(x, y, w, h, ang, 6, true)) B.push(house(x, y, w, h, ang));
-          if (rng() < 0.35) tree(x + g.nx[k] * side * (h / 2 + 22), y + g.ny[k] * side * (h / 2 + 22));
-        }
-      }
-    }
-    return B;
+  if (s.kind === 'city') cityBuildings(s, B, rng, views, clearOf, tree);
+  else organicBuildings(s, B, rng, views, clearOf, tree);
+  return B;
+}
+function plazaAt(B, clearOf, tree, x, y, rad) {
+  if (clearOf(x, y, 34, 34, 0, 6, true)) B.push({ t: 'fountain', x, y, r: 16 });
+  for (let q = 0; q < 4; q++) tree(x + Math.cos(q * TAU / 4 + .8) * rad, y + Math.sin(q * TAU / 4 + .8) * rad);
+}
+function cityBuildings(s, B, rng, views, clearOf, tree) {
+  const [hs, ss] = STREET_DIM.city, inset = hs + ss + 6;
+  const cells = [];
+  for (let a = 0; a < s.U.length - 1; a++) for (let b = 0; b < s.V.length - 1; b++) {
+    const cu = (s.U[a] + s.U[a + 1]) / 2, cv = (s.V[b] + s.V[b + 1]) / 2;
+    cells.push({ a, b, cu, cv, d: Math.hypot(cu, cv),
+                 iw: (s.U[a + 1] - s.U[a]) / 2 - inset, ih: (s.V[b + 1] - s.V[b]) / 2 - inset });
   }
-
-  const sp = s.sp, K = Math.ceil(s.R / sp);
-  const [sh0, sh1] = STREET_DIM[s.kind];
-  const inner = sp / 2 - (sh0 + sh1) - 6; // halbe Kantenlänge der bebaubaren Blockfläche
-  // Platz: der zentrumsnächste Block, durch den keine Land- oder Autobahn führt
+  cells.sort((p, q) => p.d - q.d);
+  // Stadtplatz: zentrumsnächster Block ohne Straße durch die Mitte
   let plaza = null;
-  for (const [bx, by] of [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, 1], [1, -1], [-1, -1]]) {
-    const R = roadQuery(s.x + bx * sp, s.y + by * sp, views);
-    if (!R.seg || R.edge - R.seg.sh > inner * 0.5) { plaza = [bx, by]; break; }
+  for (const cl of cells.slice(0, 9)) {
+    const [x, y] = s.toWorld(cl.cu, cl.cv), R = roadQuery(x, y, views);
+    if (!R.seg || R.edge - R.seg.sh > Math.min(cl.iw, cl.ih) * 0.5) { plaza = cl; break; }
   }
-  for (let by = -K; by <= K; by++) for (let bx = -K; bx <= K; bx++) {
-    const cx = s.x + bx * sp, cy = s.y + by * sp, dc = Math.hypot(cx - s.x, cy - s.y);
-    if (dc > s.R - inner * 1.2) continue;
-    if (plaza && bx === plaza[0] && by === plaza[1]) {
-      if (clearOf(cx, cy, 34, 34, 0, 6, true)) B.push({ t: 'fountain', x: cx, y: cy, r: 16 });
-      for (const [tx, ty] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) tree(cx + tx * inner * 0.7, cy + ty * inner * 0.7);
+  for (const cl of cells) {
+    const { a, b, cu, cv, d, iw, ih } = cl;
+    if (iw < 18 || ih < 18 || d > s.R - Math.min(iw, ih)) continue;
+    const [cx, cy] = s.toWorld(cu, cv);
+    if (cl === plaza) { plazaAt(B, clearOf, tree, cx, cy, Math.min(iw, ih) * 0.7); continue; }
+    if (hash(a, b, s.id) < 0.1) {                                            // Park
+      for (let q = 0; q < 6; q++) tree(...s.toWorld(cu + (rng() - .5) * iw * 1.6, cv + (rng() - .5) * ih * 1.6));
       continue;
     }
-    if (s.kind === 'city') {
-      if (hash(bx, by, s.id) < 0.1) {                                       // Park
-        for (let q = 0; q < 6; q++) tree(cx + (rng() - .5) * inner * 1.6, cy + (rng() - .5) * inner * 1.6);
-        continue;
-      }
-      const lx = rng() < 0.5 ? 1 : 2, ly = rng() < 0.5 ? 1 : 2, lw = inner * 2 / lx, lh = inner * 2 / ly;
-      for (let a = 0; a < lx; a++) for (let b = 0; b < ly; b++) {
-        const x = cx - inner + lw * (a + .5), y = cy - inner + lh * (b + .5), w = lw - 6, h = lh - 6;
-        // zur Mitte hin höher
-        const floors = 2 + Math.floor(rng() * (3 + 9 * Math.max(0, 1 - dc / s.R)));
-        if (clearOf(x, y, w, h, 0, 4, false))
-          B.push({ t: 'bldg', x, y, w, h, ang: 0, r: Math.hypot(w, h) / 2, floors,
-                   c1: CITY_ROOFS[Math.floor(rng() * CITY_ROOFS.length)], det: rng() });
-      }
-    } else {
-      if (plaza && bx === plaza[0] + 1 && by === plaza[1]) {             // Kirche am Marktplatz
-        if (clearOf(cx, cy, 72, 34, 0, 4, false)) B.push({ t: 'church', x: cx, y: cy, w: 72, h: 34, ang: 0, r: 40 });
-        continue;
-      }
-      // je Blockseite zwei Häuser mit der Traufe zur Straße, innen Gärten
-      for (const [nx, ny] of [[0, -1], [0, 1], [-1, 0], [1, 0]]) {
-        for (const along of [-0.45, 0.45]) {
-          if (rng() < 0.15) continue;
-          const w = 30 + rng() * 10, h = 24 + rng() * 6, ang = nx ? Math.PI / 2 : 0;
-          const x = cx + nx * (inner - h / 2) + (ny ? along * inner : 0);
-          const y = cy + ny * (inner - h / 2) + (nx ? along * inner : 0);
-          if (clearOf(x, y, w, h, ang, 4, true)) B.push(house(x, y, w, h, ang));
-        }
-      }
-      if (rng() < 0.7) tree(cx + (rng() - .5) * 16, cy + (rng() - .5) * 16);
+    const lx = iw > 75 ? 2 : rng() < 0.5 ? 1 : 2, ly = ih > 75 ? 2 : rng() < 0.5 ? 1 : 2;
+    const lw = iw * 2 / lx, lh = ih * 2 / ly;
+    // Grundstück bebauen; schneidet eine Avenue oder Landstraße hinein, kleiner aufteilen
+    const lot = (u, v, lw, lh, depth) => {
+      const [x, y] = s.toWorld(u, v), w = lw - 6, h = lh - 6;
+      if (w < 22 || h < 22) return;
+      const floors = 2 + Math.floor(rng() * (3 + 9 * Math.max(0, 1 - d / s.R)));       // zur Mitte hin höher
+      if (clearOf(x, y, w, h, s.ang, 4, false))
+        B.push({ t: 'bldg', x, y, w, h, ang: s.ang, r: Math.hypot(w, h) / 2, floors,
+                 c1: CITY_ROOFS[Math.floor(rng() * CITY_ROOFS.length)], det: rng() });
+      else if (depth < 2)
+        for (const [a2, b2] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) lot(u + a2 * lw / 4, v + b2 * lh / 4, lw / 2, lh / 2, depth + 1);
+    };
+    for (let p = 0; p < lx; p++) for (let q = 0; q < ly; q++) lot(cu - iw + lw * (p + .5), cv - ih + lh * (q + .5), lw, lh, 0);
+  }
+}
+// Dorf und Kleinstadt: Häuser entlang aller Straßen im Ort, Kirche (und Marktbrunnen) im Kern
+function organicBuildings(s, B, rng, views, clearOf, tree) {
+  const town = s.kind === 'town', own = new Set(streetsOf(s));
+  const roads = views.filter(v => v.seg.net === 1 || own.has(v.seg));
+  let best = null, bd = Infinity;
+  for (const v of roads) if (v.seg.net === 1) for (let k = v.i0; k <= v.i1; k++) {
+    const d = Math.hypot(v.seg.xs[k] - s.x, v.seg.ys[k] - s.y);
+    if (d > 40 && d < bd) { bd = d; best = [v.seg, k]; }
+  }
+  if (best) {
+    const [g, k] = best, side = rng() < 0.5 ? 1 : -1, w = town ? 72 : 64, h = town ? 34 : 30;
+    const off = g.half + g.sh + h / 2 + 14, ang = Math.atan2(-g.nx[k], g.ny[k]);
+    const x = g.xs[k] + g.nx[k] * off * side, y = g.ys[k] + g.ny[k] * off * side;
+    if (clearOf(x, y, w, h, ang, 6, true)) B.push({ t: 'church', x, y, w, h, ang, r: Math.hypot(w, h) / 2 });
+  }
+  if (town) {                                                                // Marktplatz
+    for (let q = 0; q < 12; q++) {
+      const x = s.x + Math.cos(q * 2.4) * q * 6, y = s.y + Math.sin(q * 2.4) * q * 6;
+      if (clearOf(x, y, 34, 34, 0, 6, true)) { plazaAt(B, clearOf, tree, x, y, 34); break; }
     }
   }
-  return B;
+  for (const v of roads) {
+    const g = v.seg, mine = own.has(g), stepK = Math.max(1, Math.round((town ? 48 : 60) / g.step));
+    for (let k = v.i0 + (mine ? 3 : 0); k <= v.i1; k += stepK) {
+      if (Math.hypot(g.xs[k] - s.x, g.ys[k] - s.y) > s.R * (mine ? 1.05 : 0.95)) continue;
+      for (const side of [-1, 1]) {
+        if (rng() < (town ? 0.12 : 0.22)) continue;
+        const w = 30 + rng() * 16, h = 26 + rng() * 12, off = g.half + g.sh + h / 2 + 8 + rng() * 8;
+        const x = g.xs[k] + g.nx[k] * off * side, y = g.ys[k] + g.ny[k] * off * side;
+        const ang = Math.atan2(-g.nx[k], g.ny[k]);
+        if (clearOf(x, y, w, h, ang, 6, true)) {
+          const roof = ROOFS[Math.floor(rng() * ROOFS.length)];
+          B.push({ t: 'house', x, y, w, h, ang, r: Math.hypot(w, h) / 2, c1: roof[0], c2: roof[1], chim: rng() });
+        }
+        if (rng() < 0.35) tree(x + g.nx[k] * side * (h / 2 + 22), y + g.ny[k] * side * (h / 2 + 22));
+      }
+    }
+  }
 }
 
 // ---------- Chunks ----------
@@ -797,7 +898,7 @@ function shadeCell(c, s, wx, wy, i, j, d, o) {
       g = 76 + 30 * cr.id; r = 30 + 18 * cr.id;
     }
   } else if (s === S_URBAN) {                     // Gehwegplatten
-    v = (0.95 + 0.05 * n1) * ((Math.floor(wx / 12) + Math.floor(wy / 12)) & 1 ? 0.97 : 1.02);
+    v = 0.95 + 0.05 * n1 + 0.06 * (lf - .5);
   } else if (s === S_WHEAT) {                     // Saatreihen quer zur Parzelle
     v *= (Math.floor(lastPW / 12) & 1 ? 0.93 : 1.04) + 0.08 * (n1 - .5);
   } else if (s === S_CORN) {
@@ -866,7 +967,7 @@ function finalizeChunk(c) {
 // Straßen als Vektorlinien in den Chunk zeichnen. Jedes Segment wird komplett gezeichnet,
 // damit Strichmarkierungen über Chunkgrenzen hinweg nahtlos weiterlaufen.
 const MARK = 'rgba(238,238,228,0.92)';
-const shoulderCol = s => s.type === 'street' ? '#bdb9b0' : '#9a8c74'; // Gehweg bzw. Schotterbankett
+const shoulderCol = s => s.type === 'street' && s.skind !== 'village' ? '#bdb9b0' : '#9a8c74'; // Gehweg bzw. Bankett
 // Unterbrochene Teilstücke bekommen die Lauflänge als Strich-Offset, damit das Strichmuster
 // unabhängig von Lücken (und damit in jedem Chunk gleich) weiterläuft.
 function polyLine(g, s, off, w, col, dash, pred) {
@@ -932,8 +1033,10 @@ function drawMarkings(g, s, p) {
     polyLine(g, s, LANE + 1, 1.8, MARK, null, p);
   } else if (s.type === 'street') {
     if (h > 25) polyLine(g, s, 0, 1.5, 'rgba(238,238,228,0.7)', [14, 18], p);
-    polyLine(g, s, -h, 1.5, '#8b877f', null, p);                      // Bordsteine
-    polyLine(g, s, h, 1.5, '#8b877f', null, p);
+    if (s.skind !== 'village') {
+      polyLine(g, s, -h, 1.5, '#8b877f', null, p);                    // Bordsteine
+      polyLine(g, s, h, 1.5, '#8b877f', null, p);
+    }
   } else if (s.type === 'track') {
     polyLine(g, s, 0, 5, 'rgba(96,128,62,0.55)', null, p);            // Grasnarbe in der Mitte
     polyLine(g, s, -11, 5, 'rgba(110,90,60,0.5)', null, p);           // Fahrspuren
@@ -1066,6 +1169,20 @@ function genObstacles(c) {
   for (const st of c.setl) for (const b of settlementBuildings(st)) {
     if (b.x >= ox && b.x < ox + CS && b.y >= oy && b.y < oy + CS) S.push(b);
   }
+  // Fußgänger auf Gehwegen, Plätzen und Wiesen im Ort, nicht auf der Fahrbahn und nicht in Gebäuden
+  for (const st of c.setl) {
+    const want = st.kind === 'city' ? 10 : st.kind === 'town' ? 6 : 3;
+    for (let q = 0, placed = 0; q < want * 4 && placed < want; q++) {
+      const x = ox + rng() * CS, y = oy + rng() * CS;
+      if (setlQuery(x, y, [st]).f > 0.9 || !walkable(localSurf(c, x, y))) continue;
+      if (S.some(o => o.w ? inRect(o, x, y, 8) : Math.hypot(o.x - x, o.y - y) < o.r + 6)) continue;
+      const def = DYN.person;
+      D.push({ t: 'person', person: true, x, y, r: def.r, m: def.m, vx: 0, vy: 0, a: rng() * TAU, va: 0,
+               c: def.colors[Math.floor(rng() * def.colors.length)], hair: HAIR[Math.floor(rng() * HAIR.length)],
+               walk: 16 + rng() * 12, timer: rng() * 3, phase: 0, down: 0, cross: 0 });
+      placed++;
+    }
+  }
 }
 
 function makeTree(rng, x, y) {
@@ -1107,7 +1224,9 @@ const DYN = {
   bale:   { r: 10, m: 0.4,  colors: ['#d9b85a'] },
   sheep:  { r: 7,  m: 0.15, colors: ['#f1eee6', '#e6e1d4', '#3a3633'], animal: true },
   cow:    { r: 11, m: 0.7,  colors: ['#f4f2ee', '#8a5a3a', '#2e2a28'], animal: true },
+  person: { r: 5,  m: 0.08, colors: ['#d9473b', '#3b6fd9', '#e3b23c', '#3c9a5f', '#8e5bc4', '#f0efe8', '#2f343b', '#e07a2e'] },
 };
+const HAIR = ['#2b2118', '#5a3b22', '#c9a35a', '#8a3b1f', '#9a9a9a', '#151515'];
 
 function chunkAt(x, y) {
   return chunks.get(ckey(Math.floor(x / CS), Math.floor(y / CS)));
@@ -1382,6 +1501,7 @@ function collide() {
         o.vx += j * nx / o.m; o.vy += j * ny / o.m;
         o.va += (Math.random() - .5) * j / o.m * 0.08;
         car.vx -= j * nx; car.vy -= j * ny;
+        if (o.person && -vrel > 30) { o.down = 1.6; o.cross = 0; }
       }
     }
 
@@ -1407,15 +1527,25 @@ function updateDyn(dt) {
     if (c.dyn.some(o => o.dead)) c.dyn = c.dyn.filter(o => !o.dead);
     for (const o of c.dyn) {
       if (o.animal) animalAI(o, dt);
+      else if (o.person) personAI(o, dt);
       else if (Math.abs(o.vx) + Math.abs(o.vy) + Math.abs(o.va) < 0.5) continue;
       o.x += o.vx * dt; o.y += o.vy * dt;
-      if (!o.animal) {
+      if (!o.animal && !o.person) {
         o.a += o.va * dt;
         const f = Math.exp(-2.6 * dt);
         o.vx *= f; o.vy *= f; o.va *= Math.exp(-2 * dt);
       }
       for (const s of c.statics) {
-        if (s.w) continue;
+        if (s.w) {                                    // Gebäude: aus dem Rechteck schieben
+          if (!inRect(s, o.x, o.y, o.r)) continue;
+          const cs = Math.cos(s.ang || 0), sn = Math.sin(s.ang || 0);
+          const lx = (o.x - s.x) * cs + (o.y - s.y) * sn, ly = -(o.x - s.x) * sn + (o.y - s.y) * cs;
+          const px = s.w / 2 + o.r - Math.abs(lx), py = s.h / 2 + o.r - Math.abs(ly);
+          const [ux, uy] = px < py ? [Math.sign(lx) * px, 0] : [0, Math.sign(ly) * py];
+          o.x += ux * cs - uy * sn; o.y += ux * sn + uy * cs;
+          if (o.person) o.a += Math.PI / 2;
+          continue;
+        }
         const ddx = o.x - s.x, ddy = o.y - s.y, d = Math.hypot(ddx, ddy), md = o.r + s.r * 0.75;
         if (d < md && d > 1e-4) {
           const nx = ddx / d, ny = ddy / d;
@@ -1466,6 +1596,74 @@ function paintGround(x, y, rad, fn) {
       c.ctx.save(); c.ctx.translate(-cx * CS, -cy * CS); fn(c.ctx); c.ctx.restore();
     }
   }
+}
+
+const isRoadSurf = s => s === S_ASPHALT || s === S_BRIDGE;
+const walkable = s => !isRoadSurf(s) && !SURF[s].solid && s !== S_SHALLOW && s !== S_ICE;
+function inRect(o, x, y, pad) {
+  const c = Math.cos(o.ang || 0), sn = Math.sin(o.ang || 0);
+  const lx = (x - o.x) * c + (y - o.y) * sn, ly = -(x - o.x) * sn + (y - o.y) * c;
+  return Math.abs(lx) < o.w / 2 + pad && Math.abs(ly) < o.h / 2 + pad;
+}
+
+// Fußgänger: schlendern im Ort umher und meiden die Fahrbahn. Nur zum Überqueren gehen sie
+// auf die Straße – quer zur Fahrbahn, zügig, und nur wenn kein Auto naht. Rast das Auto auf
+// sie zu, springen sie zur Seite; erwischt es sie doch, stolpern sie und stehen wieder auf.
+function personAI(o, dt) {
+  if (o.down > 0) {
+    o.down -= dt;
+    const f = Math.exp(-4 * dt); o.vx *= f; o.vy *= f;
+    return;
+  }
+  const dx = o.x - car.x, dy = o.y - car.y, dc = Math.hypot(dx, dy), cs = Math.hypot(car.vx, car.vy);
+  let speed = o.walk;
+  let dodge = false;
+  if (!car.upper && dc < 120 && cs > 40) {
+    const ux = car.vx / cs, uy = car.vy / cs, ahead = dx * ux + dy * uy, lat = -dx * uy + dy * ux;
+    if (ahead > -15 && Math.abs(lat) < 45) {                        // in der Bahn des Autos: Sprung zur Seite
+      const side = lat >= 0 ? 1 : -1;
+      o.a = Math.atan2(ux * side, -uy * side); speed = 110; dodge = true;
+    }
+  }
+  const surf = surfAtFast(o.x, o.y);
+  if (!dodge) {
+    if (o.cross > 0) {                                              // beim Überqueren
+      o.cross += dt;
+      speed = dc < 220 && cs > 20 ? 60 : 34;
+      if (!isRoadSurf(surf) && o.cross > 0.4) o.cross = 0;
+    } else if (isRoadSurf(surf)) {                                  // versehentlich auf der Straße: rasch runter
+      const R = roadQuery(o.x, o.y, segsNear(o.x, o.y, o.x, o.y));
+      if (R.seg) {
+        const nx = R.seg.nx[R.k], ny = R.seg.ny[R.k], s = Math.sign((o.x - R.seg.xs[R.k]) * nx + (o.y - R.seg.ys[R.k]) * ny) || 1;
+        o.a = Math.atan2(ny * s, nx * s);
+      }
+      speed = 40;
+    } else {
+      o.timer -= dt;
+      if (o.timer <= 0) {
+        o.timer = 1.5 + Math.random() * 4;
+        o.walk = Math.random() < 0.2 ? 0 : 16 + Math.random() * 12; // manchmal stehen bleiben
+        o.a += (Math.random() - .5) * 1.6;
+        speed = o.walk;
+      }
+      const ax = o.x + Math.cos(o.a) * 14, ay = o.y + Math.sin(o.a) * 14, sa = surfAtFast(ax, ay);
+      if (isRoadSurf(sa) && speed > 0) {
+        const quiet = dc > 280 || cs < 15;
+        const R = quiet && Math.random() < 0.3 ? roadQuery(ax, ay, segsNear(ax, ay, ax, ay)) : null;
+        if (R && R.seg) {                                           // überqueren: quer zur Fahrbahn
+          const nx = R.seg.nx[R.k], ny = R.seg.ny[R.k], s = Math.sign(Math.cos(o.a) * nx + Math.sin(o.a) * ny) || 1;
+          o.a = Math.atan2(ny * s, nx * s); o.cross = 0.01;
+        } else {
+          o.a += Math.PI * (0.6 + Math.random() * 0.8);              // umdrehen
+        }
+      } else if (!walkable(sa) || setlQuery(ax, ay, settlementsNear(ax, ay, ax, ay)).f > 1) {
+        o.a += Math.PI * (0.6 + Math.random() * 0.8);
+      }
+    }
+  }
+  const tx = Math.cos(o.a) * speed, ty = Math.sin(o.a) * speed, k = Math.min(1, dt * (dodge ? 12 : 6));
+  o.vx += (tx - o.vx) * k; o.vy += (ty - o.vy) * k;
+  o.phase += Math.hypot(o.vx, o.vy) * dt * 0.45;
 }
 
 // Tiere grasen, schlendern umher, bleiben auf ihrer Weide und weichen dem Auto aus.
@@ -1588,7 +1786,7 @@ function updateCamera(dt) {
 }
 
 // ---------- Zeichnen ----------
-const SHADOW_H = { fountain: 2, tree: 8, pine: 9, cactus: 5, bush: 3, rock: 3, stump: 2, cone: 2, barrel: 3, crate: 3, bale: 4, sheep: 3, cow: 4 };
+const SHADOW_H = { person: 2, fountain: 2, tree: 8, pine: 9, cactus: 5, bush: 3, rock: 3, stump: 2, cone: 2, barrel: 3, crate: 3, bale: 4, sheep: 3, cow: 4 };
 const HIGH = { tree: 1, pine: 1, house: 1, cactus: 1, bldg: 1, church: 1 };
 
 function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill(); }
@@ -1780,6 +1978,19 @@ function drawDyn(o) {
       ctx.beginPath(); ctx.ellipse(11, 0, 4, 3.4, 0, 0, TAU); ctx.fill();        // Kopf
       ctx.fillStyle = '#e8b4a8'; ctx.fillRect(13.5, -1.8, 2, 3.6);              // Maul
       ctx.fillStyle = '#e9e1cc'; ctx.fillRect(9.5, -5, 1.6, 2); ctx.fillRect(9.5, 3, 1.6, 2); // Hörner
+      break;
+    }
+    case 'person': {
+      if (o.down > 0) {                                  // liegt kurz am Boden
+        ctx.fillStyle = o.c; ctx.beginPath(); ctx.ellipse(-1, 0, 6.5, 3.2, 0, 0, TAU); ctx.fill();
+        ctx.fillStyle = o.hair; circle(6.5, 0, 2.6);
+        break;
+      }
+      const sw = Math.sin(o.phase) * 2.2;
+      ctx.fillStyle = '#e2b897';                          // Arme
+      circle(sw, -4.2, 1.4); circle(-sw, 4.2, 1.4);
+      ctx.fillStyle = o.c; ctx.beginPath(); ctx.ellipse(0, 0, 2.8, 4.6, 0, 0, TAU); ctx.fill();
+      ctx.fillStyle = o.hair; circle(0.4, 0, 2.6);
       break;
     }
     case 'bale':
