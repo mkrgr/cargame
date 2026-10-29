@@ -55,7 +55,8 @@
   <div><b>← → / A D</b>Lenken</div>
   <div><b>Leertaste</b>Handbremse</div>
   <div><b>R</b>Neue Welt &nbsp; <b style="min-width:0">C</b> Fahrzeug &nbsp; <b style="min-width:0">H</b> Hilfe</div>
-  <div><b>M</b>Sonderfunktion &nbsp; <b style="min-width:0">N</b> Nacht</div>
+  <div><b>M</b>Sonderfunktion &nbsp; <b style="min-width:0">E</b> Schleudersitz (007)</div>
+  <div><b>N</b>Nacht an/aus</div>
 </div>
 
 <div id="intro"><div><h1>Kleiner Flitzer</h1><p>Drück eine Taste und fahr los</p></div></div>
@@ -183,9 +184,105 @@ function mtnH(x, y, setl) {
 }
 function autumnAt(x, y) { return fbm(x / 1600, y / 1600, SEED + 90, 2) > 0.6; }
 function isWater(x, y) {
+  if (riverQuery(x, y, riversNear(x, y, x, y)).edge < 0) return true;
   if (elev(x, y) >= WL || mtnH(x, y) >= 0.2) return false;
   const S = setlQuery(x, y, settlementsNear(x, y, x, y));
   return !S.s || S.f >= 1.3;
+}
+
+// ---------- Flüsse ----------
+// Je Rasterzelle entspringt mit gewisser Wahrscheinlichkeit ein Fluss im Gebirge und fließt zum
+// nächstgelegenen großen See: Zielrichtung, Gefälle und eine Mäanderbewegung bestimmen den Lauf.
+// Er wird zur Mündung hin breiter; dort hat er tiefes Wasser in der Mitte.
+const RIV_CELL = 3200, RIV_STEP = 18;
+const rivCache = new Map();
+function lakeDeep(x, y) { return elev(x, y) < WD && mtnH(x, y) < 0.2; }
+function riverAt(i, j) {
+  const key = i + '|' + j;
+  let r = rivCache.get(key);
+  if (r !== undefined) return r;
+  rivCache.set(key, null); // schützt vor Rekursion während des Aufbaus
+  r = buildRiver(i, j);
+  rivCache.set(key, r);
+  return r;
+}
+function buildRiver(i, j) {
+  if (hash(i, j, SEED + 600) > 0.6) return null;
+  let src = null;
+  for (let q = 0; q < 14 && !src; q++) {
+    const x = (i + hash(i, j, SEED + 601 + q * 2)) * RIV_CELL, y = (j + hash(i, j, SEED + 602 + q * 2)) * RIV_CELL;
+    const m = mtnH(x, y);
+    if (m > 0.3 && m < 0.62) src = [x, y];
+  }
+  if (!src) return null;
+  let tgt = null;                                                   // nächster großer See
+  for (let r = 800; r <= 7000 && !tgt; r += 400) for (let a = 0; a < 24 && !tgt; a++) {
+    const ang = a / 24 * TAU + i, x = src[0] + Math.cos(ang) * r, y = src[1] + Math.sin(ang) * r;
+    if (lakeDeep(x, y) && lakeDeep(x + 300, y) && lakeDeep(x - 300, y) && lakeDeep(x, y + 300) && lakeDeep(x, y - 300)) tgt = [x, y];
+  }
+  if (!tgt) return null;
+  const xs = [src[0]], ys = [src[1]];
+  let x = src[0], y = src[1], dx = tgt[0] - x, dy = tgt[1] - y, l = Math.hypot(dx, dy);
+  dx /= l; dy /= l;
+  let end = -1;
+  for (let s = 0; s < 700; s++) {
+    let tx = tgt[0] - x, ty = tgt[1] - y;
+    const tl = Math.hypot(tx, ty) || 1; tx /= tl; ty /= tl;
+    const gx = elev(x + 6, y) - elev(x - 6, y), gy = elev(x, y + 6) - elev(x, y - 6), gl = Math.hypot(gx, gy) || 1;
+    let nx = tx * 0.65 - gx / gl * 0.35, ny = ty * 0.65 - gy / gl * 0.35;
+    const wob = (vnoise(s * RIV_STEP / 500, i * 13 + j * 7, SEED + 603) - 0.5) * 2.2;  // Mäander
+    const c = Math.cos(wob), sn = Math.sin(wob);
+    [nx, ny] = [nx * c - ny * sn, nx * sn + ny * c];
+    dx = dx * 0.75 + nx * 0.25; dy = dy * 0.75 + ny * 0.25; l = Math.hypot(dx, dy); dx /= l; dy /= l;
+    x += dx * RIV_STEP; y += dy * RIV_STEP; xs.push(x); ys.push(y);
+    // Mündung erst in einem großen See (kleine Teiche werden durchflossen), etwas in den See hinein
+    if (end < 0 && s > 10 && lakeDeep(x, y) && lakeDeep(x + dx * 250, y + dy * 250) &&
+        lakeDeep(x - dy * 200, y + dx * 200) && lakeDeep(x + dy * 200, y - dx * 200)) end = s + 4;
+    if (s === end) break;
+  }
+  if (end < 0) return null;
+  const n = xs.length, hw = new Float32Array(n);
+  let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
+  for (let k = 0; k < n; k++) {
+    hw[k] = 5 + 17 * Math.pow(k / (n - 1), 0.7);
+    minx = Math.min(minx, xs[k]); maxx = Math.max(maxx, xs[k]); miny = Math.min(miny, ys[k]); maxy = Math.max(maxy, ys[k]);
+  }
+  return { key: i + '|' + j, xs: Float32Array.from(xs), ys: Float32Array.from(ys), hw, n, minx, miny, maxx, maxy };
+}
+// Flüsse nahe eines Rechtecks, auf den relevanten Stützpunktbereich beschnitten
+function riversNear(x0, y0, x1, y1) {
+  const out = [], m = 40;
+  for (let j = Math.floor(y0 / RIV_CELL) - 3; j <= Math.floor(y1 / RIV_CELL) + 3; j++)
+    for (let i = Math.floor(x0 / RIV_CELL) - 3; i <= Math.floor(x1 / RIV_CELL) + 3; i++) {
+      const r = riverAt(i, j);
+      if (!r || r.maxx < x0 - m || r.minx > x1 + m || r.maxy < y0 - m || r.miny > y1 + m) continue;
+      let i0 = -1, i1 = -1;
+      for (let k = 0; k < r.n; k++) {
+        const x = r.xs[k], y = r.ys[k];
+        if (x >= x0 - m && x <= x1 + m && y >= y0 - m && y <= y1 + m) { if (i0 < 0) i0 = k; i1 = k; }
+      }
+      if (i0 >= 0) out.push({ r, i0: Math.max(0, i0 - 1), i1: Math.min(r.n - 1, i1 + 1) });
+    }
+  return out;
+}
+const NO_RIVERS = [];
+// Abstand zum Ufer (negativ = im Wasser), Abstand zur Flussmitte und halbe Breite an dieser Stelle
+const RV = { edge: 1e9, dist: 1e9, hw: 0 };
+function riverQuery(x, y, views) {
+  RV.edge = 1e9;
+  for (const v of views) {
+    const r = v.r;
+    if (x < r.minx - 40 || x > r.maxx + 40 || y < r.miny - 40 || y > r.maxy + 40) continue;
+    for (let k = v.i0; k < v.i1; k++) {
+      const ax = r.xs[k], ay = r.ys[k];
+      if (Math.abs(x - ax) > 50 || Math.abs(y - ay) > 50) continue;
+      const bx = r.xs[k + 1] - ax, by = r.ys[k + 1] - ay;
+      const t = clamp(((x - ax) * bx + (y - ay) * by) / (bx * bx + by * by), 0, 1);
+      const d = Math.hypot(x - ax - bx * t, y - ay - by * t), hw = r.hw[k] + (r.hw[k + 1] - r.hw[k]) * t;
+      if (d - hw < RV.edge) { RV.edge = d - hw; RV.dist = d; RV.hw = hw; }
+    }
+  }
+  return RV;
 }
 
 // ---------- Straßennetz ----------
@@ -270,7 +367,9 @@ function buildSeg(net, i, j, dir, key) {
     }
   }
   for (let q = 0; q < n; q++) {
-    if (isWater(xs[q], ys[q])) { water[q] = 1; wet++; }
+    // Flüsse queren die Straße oft schräg: Brücke dort, wo die Fahrbahn den Fluss irgendwo berührt
+    const nearRiver = riverQuery(xs[q], ys[q], riversNear(xs[q], ys[q], xs[q], ys[q])).edge < (net === 0 ? 92 : 50);
+    if (nearRiver || isWater(xs[q], ys[q])) { water[q] = 1; wet++; }
     if (net === 2 && forestAt(xs[q], ys[q]) > 0.52 && WOODLAND[surfaceAt(xs[q], ys[q], NO_ROADS)]) forest++;
   }
   // Waldwege nur durch Wald und nie durchs Wasser
@@ -445,12 +544,14 @@ function roadQuery(x, y, views) {
   return RQ;
 }
 
-function surfaceAt(x, y, views, setl) {
+function surfaceAt(x, y, views, setl, rivs) {
   const list = setl || settlementsNear(x, y, x, y);
   const e = elev(x, y), h = mtnH(x, y, list);
   const S = setlQuery(x, y, list), town = S.s, sf = town ? S.f : 99;
   const t = fbm(x / 2400, y / 2400, SEED + 31, 3);
-  const cold = t < 0.39, water = e < WL && h < 0.2 && sf >= 1.3;
+  const Rv = riverQuery(x, y, rivs || riversNear(x, y, x, y)), river = Rv.edge < 0, rivEdge = Rv.edge, rivHw = Rv.hw;
+  const deepRiver = river && rivHw > 11 && Rv.dist < rivHw * 0.6;
+  const cold = t < 0.39, water = (e < WL && h < 0.2 && sf >= 1.3) || river;
   const R = roadQuery(x, y, views || segsNear(x, y, x, y));
   lastE = e; lastH = h; lastCold = cold;
   let verge = false;
@@ -459,7 +560,12 @@ function surfaceAt(x, y, views, setl) {
     if (R.edge < R.seg.sh && !water) return R.seg.type === 'street' ? S_URBAN : S_GRAVEL;
     verge = R.seg.type === 'track' && R.edge < TRACK_VERGE;
   }
+  if (river) {                                                      // Flusswasser: Tiefe für die Färbung
+    lastE = deepRiver ? WD - 0.06 * (1 - Rv.dist / (rivHw * 0.6)) : WD + (WL - WD) * clamp(Rv.dist / rivHw, 0, 1);
+    return cold ? S_ICE : deepRiver ? S_DEEP : S_SHALLOW;
+  }
   if (water) return cold ? S_ICE : (e < WD ? S_DEEP : S_SHALLOW);
+  if (rivEdge < 6 && rivHw > 9 && sf >= 1) return cold ? S_SNOW : S_SAND;   // Uferstreifen
   if (sf < 1 + 0.16 * (vnoise(x / 70, y / 70, SEED + 77) - 0.5)) return urbanGround(town, x, y, cold);
   if (h > 0.6) return S_CLIFF;
   if (h > 0.35) return S_ROCK;
@@ -750,11 +856,14 @@ function settlementBuildings(s) {
   const rng = mulberry32(s.id * 7 + 13);
   const views = segsNear(s.x - s.R - 100, s.y - s.R - 100, s.x + s.R + 100, s.y + s.R + 100);
   // frei von Straßen und, wenn gewünscht, von anderen Gebäuden
+  const rivs = riversNear(s.x - s.R - 100, s.y - s.R - 100, s.x + s.R + 100, s.y + s.R + 100);
   const clearOf = (x, y, w, h, ang, pad, checkOverlap) => {
     const c = Math.cos(ang), sn = Math.sin(ang);
     for (const [u, v] of [[0, 0], [-w / 2, -h / 2], [w / 2, -h / 2], [-w / 2, h / 2], [w / 2, h / 2]]) {
-      const R = roadQuery(x + u * c - v * sn, y + u * sn + v * c, views);
+      const px = x + u * c - v * sn, py = y + u * sn + v * c;
+      const R = roadQuery(px, py, views);
       if (R.seg && R.edge - R.seg.sh < pad) return false;
+      if (rivs.length && riverQuery(px, py, rivs).edge < pad + 6) return false;   // Abstand zum Ufer
     }
     const r = Math.hypot(w, h) / 2;
     return !checkOverlap || !B.some(o => Math.hypot(o.x - x, o.y - y) < (o.r + r) * 0.85);
@@ -859,10 +968,11 @@ let spawn = { x: 0, y: 0, a: 0 };
 function newChunk(cx, cy) {
   const segs = segsNear(cx * CS, cy * CS, (cx + 1) * CS, (cy + 1) * CS);
   const setl = settlementsNear(cx * CS, cy * CS, (cx + 1) * CS, (cy + 1) * CS);
-  const s = surfaceAt((cx + .5) * CS, (cy + .5) * CS, segs, setl);
+  const rivs = riversNear(cx * CS, cy * CS, (cx + 1) * CS, (cy + 1) * CS);
+  const s = surfaceAt((cx + .5) * CS, (cy + .5) * CS, segs, setl, rivs);
   const p = SURF[s].rgb;
   return {
-    cx, cy, segs, setl, done: false, row: 0, lastUsed: frameNo,
+    cx, cy, segs, setl, rivs, done: false, row: 0, lastUsed: frameNo,
     roofImg: segs.some(v => v.seg.tunnels.length) ? new ImageData(CN, CN) : null, roof: null,
     surf: new Uint8Array(CN * CN), img: new ImageData(CN, CN),
     canvas: null, statics: [], dyn: [],
@@ -876,14 +986,14 @@ function genRows(c, n) {
   for (let j = c.row; j < end; j++) {
     for (let i = 0; i < CN; i++) {
       const wx = ox + (i + .5) * CELL, wy = oy + (j + .5) * CELL;
-      const s = surfaceAt(wx, wy, c.segs, c.setl);
+      const s = surfaceAt(wx, wy, c.segs, c.setl, c.rivs);
       const idx = j * CN + i;
       c.surf[idx] = s;
       shadeCell(c, s, wx, wy, i, j, d, idx * 4);
       // Tunneldach: dasselbe Gelände, aber ohne Straße
       if (c.roofImg) {
         const rd = c.roofImg.data, o = idx * 4;
-        if (s === S_ASPHALT || s === S_GRAVEL) shadeCell(c, surfaceAt(wx, wy, NO_ROADS, c.setl), wx, wy, i, j, rd, o);
+        if (s === S_ASPHALT || s === S_GRAVEL) shadeCell(c, surfaceAt(wx, wy, NO_ROADS, c.setl, c.rivs), wx, wy, i, j, rd, o);
         else { rd[o] = d[o]; rd[o + 1] = d[o + 1]; rd[o + 2] = d[o + 2]; rd[o + 3] = 255; }
       }
     }
@@ -1308,12 +1418,20 @@ function workChunks(budgetMs) {
 const CAR_TYPES = [
   { id: 'sport',  name: 'Sportwagen', color: '#e8432e' },
   { id: 'police', name: 'Polizei',    color: '#dfe3e8', mode: ['Blaulicht aus', 'Blaulicht an'] },
-  { id: 'taxi',   name: 'Taxi',       color: '#efe3b8', mode: ['Taxileuchte aus', 'Taxileuchte an'] },
+  { id: 'bond',   name: '007',        color: '#c9ccc8', mode: ['Waffen eingefahren', 'Maschinengewehre feuern'] },
   { id: 'kitt',   name: 'KITT',       color: '#15171b' },
   { id: 'dmc',    name: 'DeLorean',   color: '#b9bec4', mode: ['Flammen aus', 'Flammen an'] },
-  { id: 'van',    name: 'A-Team-Van', color: '#26292e' },
+  { id: 'van',    name: 'A-Team-Van', color: '#26292e', mode: ['Geschützturm eingefahren', 'Geschützturm feuert'] },
 ];
 const AIR_TIME = 1.0, BOOST_COOLDOWN = 3, FLAME_KMH = 88;
+// Geschützturm des Vans: Winkel relativ zum Fahrzeug, Ausfahrgrad 0..1
+const TURRET_X = -4, BULLET_SPEED = 900, FIRE_INTERVAL = 0.07;
+const turret = { open: 0, ang: 0, target: 0, retarget: 0, fire: 0, flash: 0 };
+// 007: Maschinengewehre vorn und Kugelfang hinten (M), Schleudersitz (E)
+const bond = { open: 0, fire: 0, flash: 0, ejectCd: 0, hatch: 0, shot: 0 };
+const flyers = [];   // Beifahrer im Flug nach dem Schleudersitz
+const EJECT_TIME = 1.3, EJECT_COOLDOWN = 2.5;
+const bullets = [];
 let clock = 0;
 const car = { x: 0, y: 0, a: 0, vx: 0, vy: 0, w: 0, steer: 0, vf: 0, vl: 0, type: 0, mode: false, air: 0, boostCd: 0,
   braking: false, reversing: false, zone: null, upper: false, bloody: 0, ws: [S_ASPHALT, S_ASPHALT, S_ASPHALT, S_ASPHALT], prevW: [null, null, null, null] };
@@ -1334,6 +1452,7 @@ addEventListener('keydown', e => {
   if (e.code === 'KeyR') newWorld(Math.floor(Math.random() * 999999) + 1);
   if (e.code === 'KeyC') { car.type = (car.type + 1) % CAR_TYPES.length; car.mode = false; }
   if (e.code === 'KeyM') carAction();
+  if (e.code === 'KeyE') ejectSeat();
   if (e.code === 'KeyH') document.getElementById('help').classList.toggle('hidden');
   if (e.code === 'KeyN') night = !night;
 });
@@ -1398,6 +1517,104 @@ function crossingWalls() {
 
 let shake = 0;
 let impactAcc = 0;
+
+// Der Turm schwenkt hektisch zu immer neuen Zielwinkeln und feuert Leuchtspur. Die Geschosse
+// treffen nichts – am Ende ihrer Flugbahn stieben nur Staub und Funken auf.
+function updateTurret(dt) {
+  const active = CAR_TYPES[car.type].id === 'van' && car.mode;
+  turret.open += ((active ? 1 : 0) - turret.open) * Math.min(1, dt * 4);
+  turret.flash = Math.max(0, turret.flash - dt);
+  if (active && turret.open > 0.95) {
+    turret.retarget -= dt;
+    if (turret.retarget <= 0) { turret.retarget = 0.25 + Math.random() * 0.9; turret.target = (Math.random() - .5) * TAU * 1.2; }
+    let d = turret.target - turret.ang;
+    d = Math.atan2(Math.sin(d), Math.cos(d));
+    turret.ang += clamp(d, -dt * 7, dt * 7) + Math.sin(clock * 23) * dt * 1.5;   // ruckelig
+    turret.fire -= dt;
+    while (turret.fire <= 0) {
+      turret.fire += FIRE_INTERVAL;
+      const fx = Math.cos(car.a), fy = Math.sin(car.a);
+      const bx = car.x + fx * TURRET_X, by = car.y + fy * TURRET_X;
+      const a = car.a + turret.ang + (Math.random() - .5) * 0.08, side = bullets.length % 2 ? 2.2 : -2.2;
+      const ca = Math.cos(a), sa = Math.sin(a);
+      const mx = bx + ca * 16 - sa * side, my = by + sa * 16 + ca * side;
+      bullets.push({ x: mx, y: my, vx: ca * BULLET_SPEED + car.vx, vy: sa * BULLET_SPEED + car.vy, life: 0.45 + Math.random() * 0.25 });
+      turret.flash = 0.04;
+      // leere Hülse seitlich ausgeworfen
+      emit(bx - sa * 6, by + ca * 6, -sa * (60 + Math.random() * 60) + car.vx, ca * (60 + Math.random() * 60) + car.vy,
+           'rgba(214,170,70,', 1.2, 0.35);
+    }
+  } else turret.fire = 0;
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.life -= dt;
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    if (b.life <= 0) {                                                 // Einschlag: nur Staub und Funken
+      for (let k = 0; k < 3; k++) {
+        const a = Math.random() * TAU, s = 20 + Math.random() * 60;
+        emit(b.x, b.y, Math.cos(a) * s, Math.sin(a) * s, k ? 'rgba(200,190,170,' : 'rgba(255,210,120,', 2 + Math.random() * 2, 0.4);
+      }
+      bullets.splice(i, 1);
+    }
+  }
+}
+
+function updateBond(dt) {
+  const on = CAR_TYPES[car.type].id === 'bond' && car.mode;
+  bond.open += ((on ? 1 : 0) - bond.open) * Math.min(1, dt * 4);
+  bond.flash = Math.max(0, bond.flash - dt);
+  bond.ejectCd = Math.max(0, bond.ejectCd - dt);
+  bond.hatch = Math.max(0, bond.hatch - dt);
+  if (on && bond.open > 0.9) {
+    bond.fire -= dt;
+    while (bond.fire <= 0) {
+      bond.fire += 0.06;
+      const fx = Math.cos(car.a), fy = Math.sin(car.a), side = (bond.shot++ % 2 ? 1 : -1) * 7;
+      const mx = car.x + fx * 28 - fy * side, my = car.y + fy * 28 + fx * side;
+      const a = car.a + (Math.random() - .5) * 0.05, ca = Math.cos(a), sa = Math.sin(a);
+      bullets.push({ x: mx, y: my, vx: ca * BULLET_SPEED + car.vx, vy: sa * BULLET_SPEED + car.vy, life: 0.5 + Math.random() * 0.2 });
+      bond.flash = 0.04;
+      emit(mx - fx * 6, my - fy * 6, -fy * side * 12 + car.vx, fx * side * 12 + car.vy, 'rgba(214,170,70,', 1.2, 0.3);
+    }
+  } else bond.fire = 0;
+  for (let i = flyers.length - 1; i >= 0; i--) {
+    const f = flyers[i];
+    f.t += dt; f.x += f.vx * dt; f.y += f.vy * dt; f.a += f.spin * dt;
+    if (f.t < EJECT_TIME) continue;
+    flyers.splice(i, 1);
+    landPassenger(f);
+  }
+}
+// Schleudersitz: Dachluke auf, Beifahrer fliegt samt Sitz im Bogen davon
+function ejectSeat() {
+  if (CAR_TYPES[car.type].id !== 'bond' || bond.ejectCd > 0 || car.air > 0) return;
+  const side = Math.random() < 0.5 ? 1 : -1, fx = Math.cos(car.a), fy = Math.sin(car.a);
+  const lat = 70 + Math.random() * 60;
+  flyers.push({ x: car.x - fy * 5, y: car.y + fx * 5, t: 0, a: car.a, spin: (Math.random() - .5) * 6,
+                vx: car.vx * 0.6 - fy * side * lat, vy: car.vy * 0.6 + fx * side * lat,
+                hair: HAIR[Math.floor(Math.random() * HAIR.length)] });
+  bond.ejectCd = EJECT_COOLDOWN; bond.hatch = 0.8;
+  shake = Math.max(shake, 2.5);
+  for (let k = 0; k < 10; k++) {
+    const a = Math.random() * TAU, s = 20 + Math.random() * 50;
+    emit(car.x, car.y, Math.cos(a) * s + car.vx * 0.5, Math.sin(a) * s + car.vy * 0.5, 'rgba(220,220,220,', 3 + Math.random() * 3, 0.5);
+  }
+}
+// Gelandet: wird ein Fußgänger, der frei herumläuft (an Land, nicht im Wasser oder Wald)
+function landPassenger(f) {
+  let x = f.x, y = f.y;
+  for (let r = 0; r < 120 && !walkable(surfAtFast(x, y)); r += 12) {
+    const a = r * 0.7; x = f.x + Math.cos(a) * r; y = f.y + Math.sin(a) * r;
+  }
+  for (let k = 0; k < 8; k++) {
+    const a = Math.random() * TAU, s = 20 + Math.random() * 40;
+    emit(x, y, Math.cos(a) * s, Math.sin(a) * s, 'rgba(200,190,170,', 3 + Math.random() * 2, 0.5);
+  }
+  const c = chunkAt(x, y);
+  if (!c || !c.done) return;
+  c.dyn.push({ t: 'person', person: true, free: true, x, y, r: DYN.person.r, m: DYN.person.m, vx: 0, vy: 0,
+               a: f.a, va: 0, c: '#2b2f36', hair: f.hair, walk: 20, timer: 1, phase: 0, down: 1.2, cross: 0 });
+}
 
 function carAction() {
   const T = CAR_TYPES[car.type];
@@ -1723,7 +1940,7 @@ function personAI(o, dt) {
         } else {
           o.a += Math.PI * (0.6 + Math.random() * 0.8);              // umdrehen
         }
-      } else if (!walkable(sa) || setlQuery(ax, ay, settlementsNear(ax, ay, ax, ay)).f > 1) {
+      } else if (!walkable(sa) || (!o.free && setlQuery(ax, ay, settlementsNear(ax, ay, ax, ay)).f > 1)) {
         o.a += Math.PI * (0.6 + Math.random() * 0.8);
       }
     }
@@ -2259,12 +2476,29 @@ function drawCar() {
       if (on) { ctx.fillStyle = 'rgba(80,150,255,0.35)'; circle(-2, blink ? -5 : 5, 11); }
       break;
     }
-    case 'taxi': {
-      sedan('#efe3b8', '#efe3b8');
-      ctx.fillStyle = '#2a2d33'; ctx.fillRect(-6, -7, 8, 14);       // Dachschild
-      ctx.fillStyle = car.mode ? '#ffd23a' : '#b8a462'; ctx.fillRect(-5, -6, 6, 12);
-      ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(-3, -4, 2, 8);
-      if (car.mode) { ctx.fillStyle = 'rgba(255,210,60,0.3)'; circle(-2, 0, 11); }
+    case 'bond': {                                                  // klassischer britischer Sportwagen
+      const o = bond.open;
+      if (o > 0.02) {                                                // Kugelfang fährt hinten aus
+        ctx.fillStyle = '#5c6066'; ctx.fillRect(-23 - 2 * o, -9, 2, 2); ctx.fillRect(-23 - 2 * o, 7, 2, 2);
+        ctx.fillStyle = '#3a3e44'; rrect(-23 - 5 * o, -12, 3.5, 24, 1);
+        ctx.fillStyle = 'rgba(255,255,255,0.18)'; ctx.fillRect(-23 - 5 * o, -11, 1, 22);
+      }
+      ctx.fillStyle = '#c9ccc8'; rrect(-23, -11.5, 46, 23, 9);
+      ctx.fillStyle = 'rgba(255,255,255,0.22)'; rrect(-21, -9.5, 42, 6, 4);
+      ctx.fillStyle = '#b3b7b3'; ctx.fillRect(6, -0.8, 15, 1.6);      // Lufthutze auf der langen Haube
+      ctx.fillStyle = glass;
+      ctx.beginPath(); ctx.moveTo(1, -9.5); ctx.lineTo(7, -8); ctx.lineTo(7, 8); ctx.lineTo(1, 9.5); ctx.closePath(); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(-12, -8.5); ctx.lineTo(-15.5, -7.5); ctx.lineTo(-15.5, 7.5); ctx.lineTo(-12, 8.5); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#c9ccc8'; rrect(-12, -8.5, 13, 17, 3);
+      if (bond.hatch > 0) { ctx.fillStyle = '#121316'; ctx.fillRect(-10, -8, 9, 7); }  // offene Dachluke
+      ctx.fillStyle = '#e2e4e6'; ctx.fillRect(22, -10, 1.5, 20); ctx.fillRect(-24, -10, 1.5, 20);  // Chromstoßstangen
+      if (o > 0.02) {                                                // Maschinengewehre hinter den Blinkern
+        ctx.fillStyle = '#1b1d20'; ctx.fillRect(22, -8, 5 * o, 2); ctx.fillRect(22, 6, 5 * o, 2);
+        if (bond.flash > 0 && o > 0.9) {
+          ctx.fillStyle = 'rgba(255,220,90,0.9)';
+          circle(28, bond.shot % 2 ? -7 : 7, 3);
+        }
+      }
       break;
     }
     case 'kitt': {
@@ -2301,6 +2535,19 @@ function drawCar() {
       ctx.beginPath(); ctx.moveTo(15, -11); ctx.lineTo(21, -10); ctx.lineTo(21, 10); ctx.lineTo(15, 11); ctx.closePath(); ctx.fill();
       ctx.fillStyle = '#1a1c20'; ctx.fillRect(-25, -11, 3, 22);       // Dachspoiler
       ctx.fillStyle = 'rgba(255,255,255,0.12)'; rrect(-19, -9, 32, 5, 2);
+      if (turret.open > 0.02) {
+        const o = turret.open;
+        ctx.fillStyle = '#0d0e10'; rrect(TURRET_X - 9 * o, -9 * o, 18 * o, 18 * o, 2);   // offene Dachluke
+        ctx.save(); ctx.translate(TURRET_X, 0); ctx.scale(o, o); ctx.rotate(turret.ang);
+        ctx.fillStyle = '#3b3f45'; circle(0, 0, 7);                  // drehbarer Turm
+        ctx.fillStyle = '#55595f'; circle(-1, -1, 4.5);
+        ctx.fillStyle = '#1b1d20'; ctx.fillRect(4, -3.4, 13, 2.2); ctx.fillRect(4, 1.2, 13, 2.2);  // Doppellauf
+        if (turret.flash > 0) {                                    // Mündungsfeuer
+          ctx.fillStyle = 'rgba(255,220,90,0.9)'; circle(18.5, -2.3, 3.2); circle(18.5, 2.3, 3.2);
+          ctx.fillStyle = 'rgba(255,140,30,0.6)'; circle(21, 0, 4.5);
+        }
+        ctx.restore();
+      }
       break;
     }
   }
@@ -2373,6 +2620,17 @@ function render() {
   for (const s of tsegs) drawPortals(s);
   for (const z of decks) drawDeck(z);
   if (car.upper) drawCar();
+  for (const f of flyers) {                                         // Beifahrer samt Sitz im Flug
+    const k = f.t / EJECT_TIME, lift = Math.sin(Math.PI * k), sc = 1 + 1.6 * lift;
+    ctx.fillStyle = `rgba(0,0,0,${(0.3 - 0.15 * lift).toFixed(3)})`;
+    circle(f.x + 4 + 40 * lift, f.y + 5 + 50 * lift, 6);
+    ctx.save(); ctx.translate(f.x, f.y); ctx.rotate(f.a); ctx.scale(sc, sc);
+    ctx.fillStyle = '#5a1f1a'; rrect(-6, -5, 10, 10, 2);           // Sitz
+    ctx.fillStyle = '#2b2f36'; ctx.beginPath(); ctx.ellipse(0, 0, 2.8, 4.6, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#e2b897'; circle(1.5, -4.4, 1.3); circle(1.5, 4.4, 1.3);
+    ctx.fillStyle = f.hair; circle(0.6, 0, 2.6);
+    ctx.restore();
+  }
   for (const q of particles) {
     if (q.fire) {                                                   // flackernde Flammen
       const a = Math.min(1, q.life / q.max * 1.6) * (0.7 + 0.3 * Math.random());
@@ -2383,6 +2641,13 @@ function render() {
     ctx.fillStyle = q.color + (0.55 * q.life / q.max).toFixed(3) + ')';
     circle(q.x, q.y, q.size);
   }
+  ctx.lineCap = 'round';
+  for (const b of bullets) {                                        // Leuchtspur
+    const sp = Math.hypot(b.vx, b.vy), ux = b.vx / sp, uy = b.vy / sp;
+    ctx.strokeStyle = 'rgba(255,200,80,0.9)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(b.x - ux * 12, b.y - uy * 12); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+  ctx.lineCap = 'butt';
   for (const o of highs) drawStatic(o);
 
   const lamps = [];
@@ -2431,7 +2696,12 @@ function specialLights() {
     const s = Math.floor(clock * 7) % 2 ? -1 : 1;
     out.push({ x: car.x - fx * 2 - fy * 5 * s, y: car.y - fy * 2 + fx * 5 * s, r: 90, cut: 0.55, glow: 0.45, col: rgba(70, 140, 255) });
   }
-  if (id === 'taxi' && car.mode) out.push({ x: car.x - fx * 2, y: car.y - fy * 2, r: 30, cut: 0.4, glow: 0.35, col: rgba(255, 210, 60) });
+  if (id === 'bond' && bond.flash > 0 && bond.open > 0.9)
+    out.push({ x: car.x + fx * 30, y: car.y + fy * 30, r: 100, cut: 0.55, glow: 0.35, col: rgba(255, 190, 90) });
+  if (id === 'van' && turret.flash > 0) {
+    const a = car.a + turret.ang, bx = car.x + fx * TURRET_X + Math.cos(a) * 19, by = car.y + fy * TURRET_X + Math.sin(a) * 19;
+    out.push({ x: bx, y: by, r: 110, cut: 0.6, glow: 0.35, col: rgba(255, 190, 90) });
+  }
   if (id === 'kitt') {
     const sy = Math.sin(clock * 5) * 7.5;
     out.push({ x: car.x + fx * 21 - fy * sy, y: car.y + fy * 21 + fx * sy, r: 22, cut: 0.3, glow: 0.5, col: rgba(255, 30, 20) });
@@ -2479,6 +2749,13 @@ function drawNight(lamps) {
     radial(ctx, L.x, L.y, L.r, [[0, L.col(L.glow * k)], [1, L.col(0)]]);
     ctx.beginPath(); ctx.arc(L.x, L.y, L.r, 0, TAU); ctx.fill();
   }
+  ctx.lineCap = 'round';                                           // Leuchtspur leuchtet selbst
+  for (const b of bullets) {
+    const sp = Math.hypot(b.vx, b.vy), ux = b.vx / sp, uy = b.vy / sp;
+    ctx.strokeStyle = `rgba(255,190,70,${(0.9 * k).toFixed(3)})`; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(b.x - ux * 14, b.y - uy * 14); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+  ctx.lineCap = 'butt';
   const fx = Math.cos(car.a), fy = Math.sin(car.a);
   const tail = car.braking ? 0.75 : 0.35;                                  // Rücklichter
   for (const sd of [-1, 1]) {
@@ -2499,7 +2776,7 @@ mapShown.width = mapShown.height = MAP_N;
 let mapRow = 0, mapCX = 0, mapCY = 0, shownCX = 0, shownCY = 0, mapReady = false;
 
 let mapRoads = [];
-let mapPlaces = [];
+let mapPlaces = [], mapRivers = [];
 const MAP_ROAD_STYLE = { street: [1.2, '#e3e1da'], track: [1, '#7d6444'], lane: [1.5, '#d6d6cf'], road: [2, '#f4f4ef'], hw: [3.5, '#f2c14e'] };
 
 function mapWork(rows) {
@@ -2507,12 +2784,13 @@ function mapWork(rows) {
     mapCX = car.x; mapCY = car.y;
     mapRoads = segsNear(car.x - MAP_R - 300, car.y - MAP_R - 300, car.x + MAP_R + 300, car.y + MAP_R + 300);
     mapPlaces = settlementsNear(car.x - MAP_R, car.y - MAP_R, car.x + MAP_R, car.y + MAP_R).filter(s => s.kind !== 'village');
+    mapRivers = riversNear(car.x - MAP_R - 300, car.y - MAP_R - 300, car.x + MAP_R + 300, car.y + MAP_R + 300);
   }
   const d = mapBuf.data;
   for (let n = 0; n < rows && mapRow < MAP_N; n++, mapRow++) {
     const wy = mapCY - MAP_R + (mapRow + .5) * MAP_CELL;
     for (let i = 0; i < MAP_N; i++) {
-      const p = SURF[surfaceAt(mapCX - MAP_R + (i + .5) * MAP_CELL, wy, NO_ROADS)].rgb;
+      const p = SURF[surfaceAt(mapCX - MAP_R + (i + .5) * MAP_CELL, wy, NO_ROADS, undefined, NO_RIVERS)].rgb;
       const o = (mapRow * MAP_N + i) * 4;
       d[o] = p[0]; d[o + 1] = p[1]; d[o + 2] = p[2]; d[o + 3] = 255;
     }
@@ -2545,6 +2823,18 @@ function drawMap() {
     mctx.stroke();
   }
   mctx.textAlign = 'center'; mctx.textBaseline = 'middle';
+  mctx.strokeStyle = '#3f86c8';                                      // Flüsse
+  for (const v of mapRivers) {
+    const r = v.r;
+    for (let q = v.i0; q < v.i1; q += 2) {
+      const q2 = Math.min(v.i1, q + 2);
+      mctx.lineWidth = Math.max(1, r.hw[q] * 2 * k);
+      mctx.beginPath();
+      mctx.moveTo((r.xs[q] - car.x) * k + S / 2, (r.ys[q] - car.y) * k + S / 2);
+      mctx.lineTo((r.xs[q2] - car.x) * k + S / 2, (r.ys[q2] - car.y) * k + S / 2);
+      mctx.stroke();
+    }
+  }
   for (const s of mapPlaces) {
     const x = (s.x - car.x) * k + S / 2, y = (s.y - car.y) * k + S / 2;
     mctx.font = s.kind === 'city' ? '700 11px system-ui, sans-serif' : '600 9px system-ui, sans-serif';
@@ -2585,7 +2875,8 @@ function updateHud() {
   if (elPlace.textContent !== place) elPlace.textContent = place;
   const T = CAR_TYPES[car.type];
   const status = T.id === 'kitt' ? (car.air > 0 ? 'Booster!' : car.boostCd > 0 ? 'Booster lädt' : 'Booster bereit (M)')
-               : T.mode ? T.mode[car.mode ? 1 : 0] + ' (M)' : '';
+               : (T.mode ? T.mode[car.mode ? 1 : 0] + ' (M)' : '') +
+                 (T.id === 'bond' ? ' · Schleudersitz ' + (bond.ejectCd > 0 ? 'lädt' : 'bereit (E)') : '');
   const typeText = T.name + (status ? ' · ' + status : '');
   if (elType.textContent !== typeText) elType.textContent = typeText;
   if (name !== hudName) {
@@ -2625,6 +2916,7 @@ function newWorld(seed) {
   segCache.clear();
   crossCache.clear();
   setlCache.clear();
+  rivCache.clear();
   allCrossings.length = 0;
   car.zone = null; car.upper = false;
   particles.length = 0;
@@ -2653,6 +2945,8 @@ function frame(now) {
   updateCamera(dt);
   clock += dt;
   car.boostCd = Math.max(0, car.boostCd - dt);
+  updateTurret(dt);
+  updateBond(dt);
   nightLevel += ((night ? 1 : 0) - nightLevel) * Math.min(1, dt * 2.5);
 
   ensureChunks();
