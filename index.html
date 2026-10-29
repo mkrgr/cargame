@@ -198,7 +198,9 @@ function buildSeg(net, i, j, dir, key) {
   }
   // Sackgassen sind immer kleine Nebenstraßen
   const deadEnd = net === 1 && (nodeDegree(net, i, j) < 2 || nodeDegree(net, i2, j2) < 2);
-  const type = net === 0 ? 'hw' : net === 1 ? (!deadEnd && hash(i, j, SEED + 330 + dir) < 0.6 ? 'road' : 'lane') : 'track';
+  // Der Straßentyp gilt für die ganze Gitterzeile bzw. -spalte, damit er nicht mitten auf der Strecke wechselt
+  const marked = hash(dir ? i : j, dir, SEED + 330) < 0.6;
+  const type = net === 0 ? 'hw' : net === 1 ? (!deadEnd && marked ? 'road' : 'lane') : 'track';
   const rt = RT[type];
   return { key, net, i, j, dir, type, rank: rt.rank, half: rt.half, sh: rt.sh, col: rt.col, xs, ys, nx, ny, water, n,
            step: plen / (n - 1),
@@ -254,30 +256,51 @@ function crossingsOf(a, b) {
         const t = ((cx - ax) * sY - (cy - ay) * sX) / den, u = ((cx - ax) * rY - (cy - ay) * rX) / den;
         if (t < 0 || t > 1 || u < 0 || u > 1) continue;
         const x = ax + rX * t, y = ay + rY * t;
-        if (!r.some(z => Math.hypot(z.x - x, z.y - y) < 200)) r.push(makeCrossing(a, b, i, j, x, y));
+        if (r.some(z => Math.hypot(z.x - x, z.y - y) < 200)) continue;
+        // Kreuzt eine Straße genau an ihrem Knoten, melden beide Nachbarstücke dieselbe Kreuzung
+        let z = allCrossings.find(q => Math.hypot(q.x - x, q.y - y) < 150 && q.lo.net + q.up.net === a.net + b.net);
+        if (!z) { z = makeCrossing(a, b, i, j, x, y); allCrossings.push(z); }
+        r.push(z);
       }
     }
   }
   crossCache.set(key, r);
   return r;
 }
+const allCrossings = [];
 function makeCrossing(a, b, i, j, x, y) {
   const sin = Math.max(0.4, Math.abs(a.ny[i] * -b.nx[j] - -a.nx[i] * b.ny[j]));
-  const aUp = b.type !== 'track' && hash(Math.floor(x), Math.floor(y), SEED + 700) < 0.5;
+  // a ist immer die Autobahn; Waldwege liegen nie auf einer Brücke
+  const aUp = b.type === 'track' || hash(Math.floor(x / 64), Math.floor(y / 64), SEED + 700) < 0.5;
   const up = aUp ? a : b, lo = aUp ? b : a;
   const span = (lo.half + lo.sh + UNDERPASS_CLEAR) / sin + 24;     // halbe Brückenlänge
   const R = Math.max(span + 80, (up.half + up.sh + 30) / sin);
-  return { x, y, up, lo, ku: aUp ? i : j, kl: aUp ? j : i, span, R,
-           ru: Math.ceil(R * 1.6 / up.step) + 2, rl: Math.ceil(R * 1.6 / lo.step) + 2 };
+  return { x, y, up, lo, span, R, upV: chainViews(up, x, y, R * 1.6), loV: chainViews(lo, x, y, R * 1.6) };
+}
+// Das Segment samt Vorgänger und Nachfolger derselben Straße, beschnitten auf den Umkreis rad
+function chainViews(s, x, y, rad) {
+  const prev = getSeg(s.net, s.dir ? s.i : s.i - 1, s.dir ? s.j - 1 : s.j, s.dir);
+  const next = getSeg(s.net, s.dir ? s.i : s.i + 1, s.dir ? s.j + 1 : s.j, s.dir);
+  const out = [];
+  for (const q of [prev, s, next]) {
+    if (!q) continue;
+    let i0 = -1, i1 = -1;
+    for (let k = 0; k < q.n; k++) if (Math.hypot(q.xs[k] - x, q.ys[k] - y) < rad) { if (i0 < 0) i0 = k; i1 = k; }
+    if (i0 >= 0) out.push({ seg: q, i0: Math.max(0, i0 - 1), i1: Math.min(q.n - 1, i1 + 1) });
+  }
+  return out;
 }
 const SN = { d: 0, x: 0, y: 0 };
-function segNearest(s, x, y, k0, k1) {
+function segNearest(views, x, y) {
   let best = 1e9;
-  for (let k = Math.max(0, k0); k < Math.min(s.n - 1, k1); k++) {
-    const ax = s.xs[k], ay = s.ys[k], bx = s.xs[k + 1] - ax, by = s.ys[k + 1] - ay;
-    const t = clamp(((x - ax) * bx + (y - ay) * by) / (bx * bx + by * by), 0, 1);
-    const qx = ax + bx * t, qy = ay + by * t, d = Math.hypot(x - qx, y - qy);
-    if (d < best) { best = d; SN.x = qx; SN.y = qy; }
+  for (const v of views) {
+    const s = v.seg;
+    for (let k = v.i0; k < v.i1; k++) {
+      const ax = s.xs[k], ay = s.ys[k], bx = s.xs[k + 1] - ax, by = s.ys[k + 1] - ay;
+      const t = clamp(((x - ax) * bx + (y - ay) * by) / (bx * bx + by * by), 0, 1);
+      const qx = ax + bx * t, qy = ay + by * t, d = Math.hypot(x - qx, y - qy);
+      if (d < best) { best = d; SN.x = qx; SN.y = qy; }
+    }
   }
   SN.d = best;
   return SN;
@@ -714,7 +737,7 @@ function updateZone() {
   }
   if (zone === car.zone) return;
   car.zone = zone;
-  car.upper = !!zone && segNearest(zone.up, car.x, car.y, zone.ku - zone.ru, zone.ku + zone.ru).d < zone.up.half + zone.up.sh;
+  car.upper = !!zone && segNearest(zone.upV, car.x, car.y).d < zone.up.half + zone.up.sh;
 }
 
 // Oben: Geländer halten das Auto auf der Brückenfahrbahn.
@@ -724,7 +747,7 @@ function crossingWalls() {
   const fx = Math.cos(car.a), fy = Math.sin(car.a);
   for (const off of COFF) {
     const px = car.x + fx * off, py = car.y + fy * off;
-    const U = segNearest(up, px, py, z.ku - z.ru, z.ku + z.ru);
+    const U = segNearest(z.upV, px, py);
     const dU = U.d, ux = U.x, uy = U.y;
     if (car.upper) {
       const lim = up.half + 1 - CR;
@@ -733,7 +756,7 @@ function crossingWalls() {
     }
     const wall = up.half + 2 + CR;
     if (dU >= wall) continue;
-    const L = segNearest(lo, px, py, z.kl - z.rl, z.kl + z.rl);
+    const L = segNearest(z.loV, px, py);
     const corr = lo.half + lo.sh + UNDERPASS_CLEAR - CR;
     if (L.d <= corr) continue;
     const penU = wall - dU, penL = L.d - corr;
@@ -1130,18 +1153,26 @@ function drawDyn(o) {
   ctx.restore();
 }
 
+// Das Deck kann über mehrere Segmente der oberen Straße reichen, daher Auswahl über den Abstand zur Kreuzung
 function drawDeck(z) {
-  const s = z.up, r = Math.ceil(z.span / s.step), k0 = z.ku - r, k1 = z.ku + r;
-  const p = k => k >= k0 && k <= k1;
+  const segs = z.upV.map(v => v.seg);
+  const preds = segs.map(s => k => Math.hypot(s.xs[k] - z.x, s.ys[k] - z.y) <= z.span);
   ctx.lineJoin = 'round'; ctx.lineCap = 'butt';
   ctx.save(); ctx.translate(12, 15);
-  polyLine(ctx, s, 0, s.half * 2 + 8, 'rgba(0,0,0,0.32)', null, p);
+  segs.forEach((s, i) => polyLine(ctx, s, 0, s.half * 2 + 8, 'rgba(0,0,0,0.32)', null, preds[i]));
   ctx.restore();
-  polyLine(ctx, s, 0, (s.half + 4) * 2, '#8b8e94', null, p);   // Brückenkante (Beton)
-  polyLine(ctx, s, 0, s.half * 2, s.col, null, p);
-  drawMarkings(ctx, s, p);
-  polyLine(ctx, s, -(s.half + 2.5), 3, '#dcd6c8', null, p);    // Geländer
-  polyLine(ctx, s, s.half + 2.5, 3, '#dcd6c8', null, p);
+  // Auffahrten neu zeichnen, damit der Schatten nicht auf die eigene Straße fällt
+  const ramps = segs.map(s => k => { const d = Math.hypot(s.xs[k] - z.x, s.ys[k] - z.y); return d > z.span - 16 && d < z.span + 40; });
+  segs.forEach((s, i) => { if (s.sh) polyLine(ctx, s, 0, (s.half + s.sh) * 2, '#9a8c74', null, ramps[i]); });
+  segs.forEach((s, i) => polyLine(ctx, s, 0, s.half * 2, s.col, null, ramps[i]));
+  segs.forEach((s, i) => drawMarkings(ctx, s, ramps[i]));
+  segs.forEach((s, i) => polyLine(ctx, s, 0, (s.half + 4) * 2, '#8b8e94', null, preds[i])); // Brückenkante (Beton)
+  segs.forEach((s, i) => polyLine(ctx, s, 0, s.half * 2, s.col, null, preds[i]));
+  segs.forEach((s, i) => drawMarkings(ctx, s, preds[i]));
+  segs.forEach((s, i) => {                                                                  // Geländer
+    polyLine(ctx, s, -(s.half + 2.5), 3, '#dcd6c8', null, preds[i]);
+    polyLine(ctx, s, s.half + 2.5, 3, '#dcd6c8', null, preds[i]);
+  });
   ctx.setLineDash([]);
 }
 
@@ -1306,8 +1337,8 @@ function updateHud() {
   let road = R.seg && R.edge < 0 ? R.seg : null, extra = s === S_BRIDGE ? ' · Brücke' : '';
   const z = car.zone;
   if (z && car.upper) { road = z.up; extra = ' · Überführung'; }
-  else if (z && segNearest(z.lo, car.x, car.y, z.kl - z.rl, z.kl + z.rl).d < z.lo.half &&
-           segNearest(z.up, car.x, car.y, z.ku - z.ru, z.ku + z.ru).d < z.up.half) { road = z.lo; extra = ' · Unterführung'; }
+  else if (z && segNearest(z.loV, car.x, car.y).d < z.lo.half &&
+           segNearest(z.upV, car.x, car.y).d < z.up.half) { road = z.lo; extra = ' · Unterführung'; }
   if (road) {
     name = RT[road.type].name + extra;
     col = road.type === 'track' ? SURF[S_GRAVEL].rgb : [86, 88, 94];
@@ -1348,6 +1379,7 @@ function newWorld(seed) {
   chunks.clear();
   segCache.clear();
   crossCache.clear();
+  allCrossings.length = 0;
   car.zone = null; car.upper = false;
   particles.length = 0;
   spawn = findSpawn();
