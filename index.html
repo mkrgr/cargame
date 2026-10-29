@@ -105,10 +105,10 @@ function mulberry32(a) {
 
 // ---------- Untergründe ----------
 const S_DEEP = 0, S_SHALLOW = 1, S_ASPHALT = 2, S_GRAVEL = 3, S_GRASS = 4, S_SAND = 5,
-      S_MUD = 6, S_SNOW = 7, S_ICE = 8, S_BRIDGE = 9;
+      S_MUD = 6, S_SNOW = 7, S_ICE = 8, S_BRIDGE = 9, S_DENSE = 10, S_ROCK = 11, S_CLIFF = 12, S_HEATH = 13;
 // grip: Seitenhaftung, accel/top: Anteil an Motorleistung/Höchstgeschwindigkeit, drag: Rollwiderstand, brake: Bremswirkung
 const SURF = [
-  { name: 'Tiefes Wasser',  rgb: [34, 86, 140],   grip: 3,   accel: .4,  top: .4,  drag: 1.6, brake: .6 },
+  { name: 'Tiefes Wasser',  rgb: [34, 86, 140],   grip: 3,   accel: .4,  top: .4,  drag: 1.6, brake: .6, solid: true },
   { name: 'Flaches Wasser', rgb: [74, 148, 196],  grip: 3,   accel: .45, top: .42, drag: 1.6, brake: .6, dust: 'rgba(225,242,255,', splash: true },
   { name: 'Asphalt',        rgb: [74, 76, 82],    grip: 8.5, accel: 1,   top: 1,   drag: .12, brake: 1,  skid: 'rgba(22,22,26,0.33)', smoke: true },
   { name: 'Schotter',       rgb: [156, 142, 120], grip: 4.2, accel: .8,  top: .82, drag: .4,  brake: .75, track: 'rgba(95,82,64,0.20)', dust: 'rgba(180,165,140,' },
@@ -118,12 +118,58 @@ const SURF = [
   { name: 'Schnee',         rgb: [234, 239, 245], grip: 2.8, accel: .6,  top: .66, drag: .7,  brake: .45, track: 'rgba(150,162,185,0.32)', dust: 'rgba(255,255,255,' },
   { name: 'Eis',            rgb: [176, 214, 234], grip: .5,  accel: .3,  top: .95, drag: .05, brake: .15, skid: 'rgba(255,255,255,0.22)' },
   { name: 'Brücke',         rgb: [138, 100, 64],  grip: 7,   accel: .95, top: .9,  drag: .2,  brake: .9, skid: 'rgba(40,28,18,0.3)' },
+  { name: 'Dichter Wald',   rgb: [36, 80, 40],    grip: 5,   accel: .75, top: .72, drag: .55, brake: .7, solid: true },
+  { name: 'Fels',           rgb: [158, 146, 124], grip: 4.6, accel: .7,  top: .68, drag: .5,  brake: .8, dust: 'rgba(170,165,155,', dustSlipOnly: true },
+  { name: 'Felswand',       rgb: [88, 88, 94],   grip: 4.6, accel: .7,  top: .68, drag: .5,  brake: .8, solid: true },
+  { name: 'Heide',          rgb: [148, 138, 86],  grip: 4.6, accel: .72, top: .7,  drag: .6,  brake: .7, track: 'rgba(90,80,45,0.18)', dust: 'rgba(150,135,90,', dustSlipOnly: true },
 ];
 
-let lastE = 0, lastM = 0;
+let lastE = 0, lastM = 0, lastH = 0, lastCold = false;
 
-function elev(x, y) { return fbm(x / 650, y / 650, SEED, 4); }
-function forestAt(x, y) { return fbm(x / 450, y / 450, SEED + 61, 2); }
+const WL = 0.395, WD = 0.37;   // Wasserspiegel, Grenze zum tiefen Wasser
+const DENSE_F = 0.68;          // ab hier ist der Wald undurchdringlich
+
+// großräumige Seen plus kleinere Teiche
+function elev(x, y) { return 0.62 * fbm(x / 1800, y / 1800, SEED, 3) + 0.38 * fbm(x / 450, y / 450, SEED + 3, 3); }
+function forestAt(x, y) { return fbm(x / 700, y / 700, SEED + 61, 2); }
+// Jede Oktave gedreht, sonst folgen die Grate dem achsparallelen Rauschgitter
+const ROT = [0, 0.9, 2.1, 3.3].map(a => [Math.cos(a), Math.sin(a)]);
+function ridged(x, y, s, oct) {
+  let sum = 0, amp = 0.5, f = 1, norm = 0;
+  for (let i = 0; i < oct; i++) {
+    const [c, sn] = ROT[i];
+    const v = 1 - Math.abs(2 * vnoise((x * c - y * sn) * f, (x * sn + y * c) * f, s + i * 101) - 1);
+    sum += amp * v * v; norm += amp; amp *= 0.5; f *= 2;
+  }
+  return sum / norm;
+}
+// Einzelne Baumkronen für den dichten Wald: nächster verschobener Gitterpunkt
+const CROWN = { shade: 0, id: 0 };
+function crownAt(x, y) {
+  const G = 20, gx = Math.floor(x / G), gy = Math.floor(y / G);
+  let best = 0, id = 0;
+  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    const cx = gx + dx, cy = gy + dy;
+    const px = (cx + hash(cx, cy, SEED + 11)) * G, py = (cy + hash(cx, cy, SEED + 12)) * G;
+    const rr = G * (0.75 + 0.45 * hash(cx, cy, SEED + 13));
+    // Lichtkante oben links: Abstand zu leicht versetztem Mittelpunkt
+    const d2 = ((x - px + 3) ** 2 + (y - py + 3) ** 2) / (rr * rr);
+    const v = 1 - d2;
+    if (v > best) { best = v; id = hash(cx, cy, SEED + 14); }
+  }
+  CROWN.shade = best; CROWN.id = id;
+  return CROWN;
+}
+// Gebirgshöhe 0..1: großräumige Maske mal Grate. >0.35 Fels, >0.6 Felswand, >0.8 Schneegipfel
+function mtnH(x, y) {
+  const mask = fbm(x / 2600, y / 2600, SEED + 80, 3);
+  if (mask < 0.6) return 0;
+  let k = clamp((mask - 0.6) / 0.12, 0, 1);
+  k = k * k * (3 - 2 * k);
+  return k * (0.3 + 0.7 * ridged(x / 600, y / 600, SEED + 81, 4));
+}
+function autumnAt(x, y) { return fbm(x / 1600, y / 1600, SEED + 90, 2) > 0.6; }
+function isWater(x, y) { return elev(x, y) < WL && mtnH(x, y) < 0.2; }
 
 // ---------- Straßennetz ----------
 // Drei Netze auf unterschiedlich groben Gittern: verschobene Knoten, verbunden durch Bézierkurven
@@ -153,7 +199,7 @@ function edgeExists(net, i, j, dir) {
   if (net === 0) return dir ? hash(i, 0, SEED + 301) < 0.4 : hash(0, j, SEED + 300) < 0.4;
   return hash(i, j, SEED + 310 + net * 2 + dir) < (net === 1 ? 0.68 : 0.6);
 }
-const WOODLAND = { [S_GRASS]: 1, [S_SNOW]: 1, [S_MUD]: 1 };
+const WOODLAND = { [S_GRASS]: 1, [S_SNOW]: 1, [S_MUD]: 1, [S_DENSE]: 1, [S_HEATH]: 1 };
 function nodeDegree(net, i, j) {
   return edgeExists(net, i, j, 0) + edgeExists(net, i - 1, j, 0) + edgeExists(net, i, j, 1) + edgeExists(net, i, j - 1, 1);
 }
@@ -178,12 +224,29 @@ function buildSeg(net, i, j, dir, key) {
   const n = Math.max(6, Math.ceil(len / 14)) + 1;
   const xs = new Float32Array(n), ys = new Float32Array(n), nx = new Float32Array(n), ny = new Float32Array(n);
   const water = new Uint8Array(n);
-  let forest = 0, wet = 0;
+  let forest = 0, wet = 0, mt = 0;
   for (let q = 0; q < n; q++) {
     const t = q / (n - 1), u = 1 - t, b0 = u * u * u, b1 = 3 * u * u * t, b2 = 3 * u * t * t, b3 = t * t * t;
     xs[q] = b0 * A[0] + b1 * P1[0] + b2 * P2[0] + b3 * B[0];
     ys[q] = b0 * A[1] + b1 * P1[1] + b2 * P2[1] + b3 * B[1];
-    if (elev(xs[q], ys[q]) < 0.37) { water[q] = 1; wet++; }
+    if (mtnH(xs[q], ys[q]) > 0.3) mt++;
+  }
+  const mtn = net !== 2 && mt > n * 0.1;
+  // Gebirgsstraßen schlängeln sich in Serpentinen; an den Knoten (t=0/1) bleibt die Lage unverändert
+  if (mtn && net === 1) {
+    const ox = xs.slice(), oy = ys.slice();
+    const amp = 90 * Math.min(1, mt / (n * 0.4)), phase = hash(i, j, SEED + 340 + dir) * TAU;
+    let arc = 0;
+    for (let q = 0; q < n; q++) {
+      const a = Math.max(0, q - 1), b = Math.min(n - 1, q + 1);
+      const tx = ox[b] - ox[a], ty = oy[b] - oy[a], l = Math.hypot(tx, ty) || 1;
+      if (q) arc += Math.hypot(ox[q] - ox[q - 1], oy[q] - oy[q - 1]);
+      const off = amp * Math.sin(Math.PI * q / (n - 1)) * Math.sin(arc / 520 * TAU + phase);
+      xs[q] = ox[q] - ty / l * off; ys[q] = oy[q] + tx / l * off;
+    }
+  }
+  for (let q = 0; q < n; q++) {
+    if (isWater(xs[q], ys[q])) { water[q] = 1; wet++; }
     if (net === 2 && forestAt(xs[q], ys[q]) > 0.52 && WOODLAND[surfaceAt(xs[q], ys[q], NO_ROADS)]) forest++;
   }
   // Waldwege nur durch Wald und nie durchs Wasser
@@ -203,7 +266,7 @@ function buildSeg(net, i, j, dir, key) {
   const type = net === 0 ? 'hw' : net === 1 ? (!deadEnd && marked ? 'road' : 'lane') : 'track';
   const rt = RT[type];
   return { key, net, i, j, dir, type, rank: rt.rank, half: rt.half, sh: rt.sh, col: rt.col, xs, ys, nx, ny, water, n,
-           step: plen / (n - 1),
+           step: plen / (n - 1), mtn,
            hasWater: wet > 0, minx, miny, maxx, maxy };
 }
 
@@ -328,22 +391,28 @@ function roadQuery(x, y, views) {
 }
 
 function surfaceAt(x, y, views) {
-  const e = elev(x, y);
+  const e = elev(x, y), h = mtnH(x, y);
   const t = fbm(x / 2400, y / 2400, SEED + 31, 3);
-  const cold = t < 0.39, water = e < 0.37;
+  const cold = t < 0.39, water = e < WL && h < 0.2;
   const R = roadQuery(x, y, views || segsNear(x, y, x, y));
-  lastE = e;
+  lastE = e; lastH = h; lastCold = cold;
   if (R.seg) {
     if (R.edge < 0) return R.seg.type === 'track' ? S_GRAVEL : (water ? S_BRIDGE : S_ASPHALT);
     if (R.edge < R.seg.sh && !water) return S_GRAVEL;
   }
-  if (water) return cold ? S_ICE : (e < 0.33 ? S_DEEP : S_SHALLOW);
-  if (e < 0.395) return cold ? S_SNOW : S_SAND;
+  if (water) return cold ? S_ICE : (e < WD ? S_DEEP : S_SHALLOW);
+  if (h > 0.6) return S_CLIFF;
+  if (h > 0.35) return S_ROCK;
+  if (e < WL + 0.025 && h < 0.2) return cold ? S_SNOW : S_SAND;
   const m = fbm(x / 800, y / 800, SEED + 47, 3);
+  const f = forestAt(x, y);
   lastM = m;
-  if (cold) return m > 0.68 ? S_ICE : S_SNOW;
+  if (cold) return f > DENSE_F ? S_DENSE : m > 0.68 ? S_ICE : S_SNOW;
   if (t > 0.62) return m > 0.66 ? S_GRASS : S_SAND;
+  if (m > 0.7) return vnoise(x / 70, y / 70, SEED + 9) > 0.55 ? S_SHALLOW : S_MUD; // Sumpf
   if (m > 0.63) return S_MUD;
+  if (f > DENSE_F) return S_DENSE;
+  if (m < 0.38) return S_HEATH;
   return S_GRASS;
 }
 
@@ -382,16 +451,37 @@ function genRows(c, n) {
       const lf = vnoise(wx / 90, wy / 90, SEED + 5);
       let v = 0.94 + 0.08 * n1 + 0.2 * (lf - .5);
       if (s === S_DEEP) {
-        const k = clamp((lastE - 0.22) / 0.11, 0, 1);
+        const k = clamp((lastE - (WD - 0.13)) / 0.13, 0, 1);
         r = 24 + 22 * k; g = 62 + 36 * k; b = 112 + 38 * k; v = 0.97 + 0.05 * n1;
       } else if (s === S_SHALLOW) {
-        const k = clamp((lastE - 0.33) / 0.04, 0, 1);
+        const k = clamp((lastE - WD) / (WL - WD), 0, 1);
         r = 58 + 40 * k; g = 128 + 42 * k; b = 182 + 18 * k; v = 0.97 + 0.05 * n1;
       } else if (s === S_GRASS) {
         const k = 0.5 - lastM; // trockener = gelblicher
         r += k * 130; g += k * 30; b -= k * 20;
       } else if (s === S_ICE) {
         v = 0.95 + 0.1 * n1 + 0.12 * (lf - .5);
+      } else if (s === S_DENSE) {
+        const cr = crownAt(wx, wy);
+        v = 0.45 + 0.75 * Math.sqrt(cr.shade);
+        if (lastCold) {
+          r = 34; g = 72; b = 60;
+          if (cr.shade > 0.55 && cr.id > 0.4) { r = 214; g = 222; b = 230; } // Schnee auf den Kronen
+        } else if (autumnAt(wx, wy)) {
+          const pal = [[176, 84, 34], [196, 140, 40], [150, 52, 36], [96, 112, 46]];
+          [r, g, b] = pal[Math.floor(cr.id * pal.length)];
+        } else {
+          g = 76 + 30 * cr.id; r = 30 + 18 * cr.id;
+        }
+      } else if (s === S_HEATH) {
+        if (n1 > 0.84) { r = 146; g = 96; b = 150; } // Heidekraut
+      } else if (s === S_CLIFF && lastH > 0.8) {
+        r = 232; g = 236; b = 242;                   // Schneegipfel
+      }
+      if (lastH > 0.12 && s !== S_SHALLOW && s !== S_DEEP) {
+        const hh = lastH; // Hangschattierung, Licht von oben links
+        v *= 1 + clamp((mtnH(wx - 5, wy - 5) - mtnH(wx + 5, wy + 5)) * (s === S_CLIFF ? 11 : 7), -0.5, 0.5);
+        lastH = hh;
       }
       const o = idx * 4;
       d[o] = clamp(r * v, 0, 255); d[o + 1] = clamp(g * v, 0, 255); d[o + 2] = clamp(b * v, 0, 255); d[o + 3] = 255;
@@ -496,6 +586,12 @@ function drawMarkings(g, s, p) {
     polyLine(g, s, -7, 4, 'rgba(110,90,60,0.5)', null, p);            // Fahrspuren
     polyLine(g, s, 7, 4, 'rgba(110,90,60,0.5)', null, p);
   }
+  if (s.mtn) {                                                        // Leitplanken im Gebirge
+    for (const sg of [-1, 1]) {
+      polyLine(g, s, sg * (h + s.sh - 2), 2.5, '#d5d8dc', null, p);
+      polyLine(g, s, sg * (h + s.sh - 2), 4, '#5b5f66', [2, 16], p);
+    }
+  }
 }
 function drawRoads(c) {
   const g = c.ctx;
@@ -582,6 +678,13 @@ function genObstacles(c) {
       if (r < 0.14) o = { t: 'stump', x, y, r: 6 + rng() * 3 };
       else if (r < 0.26) o = { t: 'bush', x, y, r: 6 + rng() * 3, dead: true };
       else if (r < 0.3) { addDyn('crate', x, y); continue; }
+    } else if (s === S_ROCK) {
+      if (r < 0.14) o = makeRock(rng, x, y, 1.6);
+      else if (r < 0.2) o = { ...makeTree(rng, x, y), t: 'pine', snow: fbm(x / 2400, y / 2400, SEED + 31, 3) < 0.45 };
+    } else if (s === S_HEATH) {
+      if (r < 0.1) o = { t: 'bush', x, y, r: 5 + rng() * 4, heath: true };
+      else if (r < 0.14) o = makeRock(rng, x, y);
+      else if (r < 0.17) o = makeTree(rng, x, y);
     } else if (s === S_ICE) {
       if (r < 0.04) o = makeRock(rng, x, y);
     } else if (s === S_SHALLOW) {
@@ -600,7 +703,8 @@ function genObstacles(c) {
 
 function makeTree(rng, x, y) {
   const r = 12 + rng() * 10;
-  const h = 95 + rng() * 35, l = 26 + rng() * 8;
+  const autumn = autumnAt(x, y) && rng() < 0.85;
+  const h = autumn ? 15 + rng() * 35 : 95 + rng() * 35, l = autumn ? 36 + rng() * 8 : 26 + rng() * 8;
   const blobs = [];
   const n = 5 + Math.floor(rng() * 2), a0 = rng() * TAU;
   for (let i = 0; i < n; i++) {
@@ -610,8 +714,8 @@ function makeTree(rng, x, y) {
   return { t: 'tree', x, y, r, blobs,
     c1: `hsl(${h},42%,${l}%)`, c2: `hsl(${h - 8},45%,${l + 9}%)`, c3: `hsl(${h - 15},50%,${l + 18}%)` };
 }
-function makeRock(rng, x, y) {
-  const r = 7 + rng() * 9, pts = [];
+function makeRock(rng, x, y, scale = 1) {
+  const r = (7 + rng() * 9) * scale, pts = [];
   for (let i = 0; i < 8; i++) pts.push(.75 + rng() * .3);
   const l = 48 + rng() * 14;
   return { t: 'rock', x, y, r, pts, c1: `hsl(30,4%,${l}%)`, c2: `hsl(30,5%,${l + 12}%)` };
@@ -775,7 +879,7 @@ function physics(dt) {
   for (let i = 0; i < 4; i++) {
     const w = WHEELS[i];
     let s = surfAtFast(car.x + fx * w[0] + rx * w[1], car.y + fy * w[0] + ry * w[1]);
-    if (s === S_DEEP) s = S_SHALLOW;
+    if (SURF[s].solid) s = s === S_DEEP ? S_SHALLOW : S_ROCK;
     car.ws[i] = s;
     const p = SURF[s];
     G += p.grip; A += p.accel; T += p.top; Dr += p.drag; B += p.brake;
@@ -904,11 +1008,12 @@ function collide() {
       }
     }
 
-    if (surfAtFast(px, py) === S_DEEP) {
+    // tiefes Wasser, dichter Wald und Felswände sind undurchdringlich
+    if (SURF[surfAtFast(px, py)].solid) {
       let nx = 0, ny = 0;
       for (let k = 0; k < 8; k++) {
         const a = k / 8 * TAU, ax = Math.cos(a), ay = Math.sin(a);
-        if (surfAtFast(px + ax * 18, py + ay * 18) !== S_DEEP) { nx += ax; ny += ay; }
+        if (!SURF[surfAtFast(px + ax * 18, py + ay * 18)].solid) { nx += ax; ny += ay; }
       }
       let l = Math.hypot(nx, ny);
       if (l < 1e-4) { nx = -car.vx; ny = -car.vy; l = Math.hypot(nx, ny) || 1; }
@@ -1066,9 +1171,9 @@ function drawStatic(o) {
       break;
     }
     case 'bush': {
-      ctx.fillStyle = o.dead ? '#6b5a3c' : '#3f7a3a';
+      ctx.fillStyle = o.dead ? '#6b5a3c' : o.heath ? '#7a5a7e' : '#3f7a3a';
       circle(o.x - o.r * .35, o.y, o.r * .7); circle(o.x + o.r * .35, o.y + o.r * .1, o.r * .65); circle(o.x, o.y - o.r * .35, o.r * .65);
-      ctx.fillStyle = o.dead ? '#86724d' : '#579a4c';
+      ctx.fillStyle = o.dead ? '#86724d' : o.heath ? '#a57aa8' : '#579a4c';
       circle(o.x - o.r * .2, o.y - o.r * .4, o.r * .35);
       break;
     }
@@ -1340,7 +1445,7 @@ function updateHud() {
   else if (z && segNearest(z.loV, car.x, car.y).d < z.lo.half &&
            segNearest(z.upV, car.x, car.y).d < z.up.half) { road = z.lo; extra = ' · Unterführung'; }
   if (road) {
-    name = RT[road.type].name + extra;
+    name = (road.mtn && road.net === 1 ? 'Gebirgsstraße' : RT[road.type].name) + extra;
     col = road.type === 'track' ? SURF[S_GRAVEL].rgb : [86, 88, 94];
   }
   if (name !== hudName) {
