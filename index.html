@@ -188,8 +188,9 @@ function buildSeg(net, i, j, dir, key) {
   }
   // Waldwege nur durch Wald und nie durchs Wasser
   if (net === 2 && (wet > 0 || forest < n * 0.6)) return null;
-  let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
+  let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9, plen = 0;
   for (let q = 0; q < n; q++) {
+    if (q) plen += Math.hypot(xs[q] - xs[q - 1], ys[q] - ys[q - 1]);
     const a = Math.max(0, q - 1), b = Math.min(n - 1, q + 1);
     const tx = xs[b] - xs[a], ty = ys[b] - ys[a], l = Math.hypot(tx, ty) || 1;
     nx[q] = -ty / l; ny[q] = tx / l; // zeigt in Fahrtrichtung nach rechts
@@ -200,6 +201,7 @@ function buildSeg(net, i, j, dir, key) {
   const type = net === 0 ? 'hw' : net === 1 ? (!deadEnd && hash(i, j, SEED + 330 + dir) < 0.6 ? 'road' : 'lane') : 'track';
   const rt = RT[type];
   return { key, net, i, j, dir, type, rank: rt.rank, half: rt.half, sh: rt.sh, col: rt.col, xs, ys, nx, ny, water, n,
+           step: plen / (n - 1),
            hasWater: wet > 0, minx, miny, maxx, maxy };
 }
 
@@ -227,6 +229,58 @@ function segsNear(x0, y0, x1, y1) {
   }
   out.sort((a, b) => b.seg.net - a.seg.net || (a.seg.key < b.seg.key ? -1 : a.seg.key > b.seg.key ? 1 : 0));
   return out;
+}
+
+// ---------- Über- und Unterführungen ----------
+// Wo eine Autobahn eine andere Straße kreuzt, liegt eine der beiden auf einer Brücke.
+// Im Umkreis R der Kreuzung bestimmt die Einfahrt, auf welcher Ebene das Auto fährt.
+const crossCache = new Map();
+const UNDERPASS_CLEAR = 14; // seitlicher Freiraum unter der Brücke neben dem Bankett
+function crossingsOf(a, b) {
+  const key = a.key + '#' + b.key;
+  let r = crossCache.get(key);
+  if (r) return r;
+  r = [];
+  if (!(a.maxx < b.minx || a.minx > b.maxx || a.maxy < b.miny || a.miny > b.maxy)) {
+    for (let i = 0; i < a.n - 1; i++) {
+      const ax = a.xs[i], ay = a.ys[i], bx = a.xs[i + 1], by = a.ys[i + 1];
+      if (Math.max(ax, bx) < b.minx || Math.min(ax, bx) > b.maxx || Math.max(ay, by) < b.miny || Math.min(ay, by) > b.maxy) continue;
+      for (let j = 0; j < b.n - 1; j++) {
+        const cx = b.xs[j], cy = b.ys[j], dx = b.xs[j + 1], dy = b.ys[j + 1];
+        if (Math.min(cx, dx) > Math.max(ax, bx) || Math.max(cx, dx) < Math.min(ax, bx) ||
+            Math.min(cy, dy) > Math.max(ay, by) || Math.max(cy, dy) < Math.min(ay, by)) continue;
+        const rX = bx - ax, rY = by - ay, sX = dx - cx, sY = dy - cy, den = rX * sY - rY * sX;
+        if (Math.abs(den) < 1e-9) continue;
+        const t = ((cx - ax) * sY - (cy - ay) * sX) / den, u = ((cx - ax) * rY - (cy - ay) * rX) / den;
+        if (t < 0 || t > 1 || u < 0 || u > 1) continue;
+        const x = ax + rX * t, y = ay + rY * t;
+        if (!r.some(z => Math.hypot(z.x - x, z.y - y) < 200)) r.push(makeCrossing(a, b, i, j, x, y));
+      }
+    }
+  }
+  crossCache.set(key, r);
+  return r;
+}
+function makeCrossing(a, b, i, j, x, y) {
+  const sin = Math.max(0.4, Math.abs(a.ny[i] * -b.nx[j] - -a.nx[i] * b.ny[j]));
+  const aUp = b.type !== 'track' && hash(Math.floor(x), Math.floor(y), SEED + 700) < 0.5;
+  const up = aUp ? a : b, lo = aUp ? b : a;
+  const span = (lo.half + lo.sh + UNDERPASS_CLEAR) / sin + 24;     // halbe Brückenlänge
+  const R = Math.max(span + 80, (up.half + up.sh + 30) / sin);
+  return { x, y, up, lo, ku: aUp ? i : j, kl: aUp ? j : i, span, R,
+           ru: Math.ceil(R * 1.6 / up.step) + 2, rl: Math.ceil(R * 1.6 / lo.step) + 2 };
+}
+const SN = { d: 0, x: 0, y: 0 };
+function segNearest(s, x, y, k0, k1) {
+  let best = 1e9;
+  for (let k = Math.max(0, k0); k < Math.min(s.n - 1, k1); k++) {
+    const ax = s.xs[k], ay = s.ys[k], bx = s.xs[k + 1] - ax, by = s.ys[k + 1] - ay;
+    const t = clamp(((x - ax) * bx + (y - ay) * by) / (bx * bx + by * by), 0, 1);
+    const qx = ax + bx * t, qy = ay + by * t, d = Math.hypot(x - qx, y - qy);
+    if (d < best) { best = d; SN.x = qx; SN.y = qy; }
+  }
+  SN.d = best;
+  return SN;
 }
 
 // Vorzeichenbehafteter Abstand zum Fahrbahnrand (negativ = auf der Fahrbahn)
@@ -336,6 +390,14 @@ function finalizeChunk(c) {
   c.ctx = g;
   c.img = null;
   drawRoads(c);
+  c.crossings = [];
+  const segs = c.segs.map(v => v.seg);
+  for (const a of segs) if (a.net === 0) for (const b of segs) if (b.net !== 0) {
+    for (const z of crossingsOf(a, b)) {
+      if (z.x > c.cx * CS - 300 && z.x < (c.cx + 1) * CS + 300 && z.y > c.cy * CS - 300 && z.y < (c.cy + 1) * CS + 300 &&
+          !c.crossings.includes(z)) c.crossings.push(z);
+    }
+  }
   genObstacles(c);
   c.done = true;
 }
@@ -384,6 +446,7 @@ function markPred(c, s) {
   const others = c.segs.filter(v => {
     const o = v.seg;
     if (o === s || o.rank < s.rank) return false;
+    if ((o.net === 0) !== (s.net === 0)) return false; // Über-/Unterführung: Linien laufen durch
     if (o.net === s.net && o.dir === s.dir && (s.dir ? o.i === s.i : o.j === s.j)) return false;
     return !(o.maxx < s.minx - 100 || o.minx > s.maxx + 100 || o.maxy < s.miny - 100 || o.miny > s.maxy + 100);
   });
@@ -468,6 +531,7 @@ function genObstacles(c) {
   };
   const addDyn = (t, x, y, onRoad) => {
     const def = DYN[t];
+    if (c.crossings.some(z => Math.hypot(x - z.x, y - z.y) < z.R)) return;
     if (free(x, y, def.r, onRoad)) D.push({ t, x, y, r: def.r, m: def.m, vx: 0, vy: 0, a: rng() * TAU, va: 0, c: def.colors[Math.floor(rng() * def.colors.length)] });
   };
 
@@ -602,7 +666,7 @@ function workChunks(budgetMs) {
 // ---------- Auto ----------
 const CAR_COLORS = ['#e8432e', '#2f7de1', '#f2b705', '#2bb673', '#f3f3f0', '#8e4fc4', '#1f2329'];
 const car = { x: 0, y: 0, a: 0, vx: 0, vy: 0, w: 0, steer: 0, vf: 0, vl: 0, color: 0,
-  braking: false, reversing: false, ws: [S_ASPHALT, S_ASPHALT, S_ASPHALT, S_ASPHALT], prevW: [null, null, null, null] };
+  braking: false, reversing: false, zone: null, upper: false, ws: [S_ASPHALT, S_ASPHALT, S_ASPHALT, S_ASPHALT], prevW: [null, null, null, null] };
 const WHEELS = [[14, -10], [14, 10], [-14, -10], [-14, 10]]; // vorne links/rechts, hinten links/rechts
 const TOP = 560, ACC = 430, REV_TOP = 190, REV_ACC = 300, BRAKE = 950;
 const KMH = 0.25;
@@ -633,6 +697,48 @@ function gatherNearby() {
     if (!c || !c.done) continue;
     for (const o of c.statics) if (Math.abs(o.x - car.x) < o.r + 80 && Math.abs(o.y - car.y) < o.r + 80) nearStatics.push(o);
     for (const o of c.dyn) if (Math.abs(o.x - car.x) < 120 && Math.abs(o.y - car.y) < 120) nearDyn.push(o);
+  }
+  updateZone();
+}
+
+function updateZone() {
+  let zone = null, zd = Infinity;
+  const ccx = Math.floor(car.x / CS), ccy = Math.floor(car.y / CS);
+  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    const c = chunks.get(ckey(ccx + dx, ccy + dy));
+    if (!c || !c.done) continue;
+    for (const z of c.crossings) {
+      const d = Math.hypot(car.x - z.x, car.y - z.y);
+      if (d < z.R && d < zd) { zone = z; zd = d; }
+    }
+  }
+  if (zone === car.zone) return;
+  car.zone = zone;
+  car.upper = !!zone && segNearest(zone.up, car.x, car.y, zone.ku - zone.ru, zone.ku + zone.ru).d < zone.up.half + zone.up.sh;
+}
+
+// Oben: Geländer halten das Auto auf der Brückenfahrbahn.
+// Unten: die Rampen/Widerlager der oberen Straße sind Wände, frei bleibt nur der Korridor der unteren Straße.
+function crossingWalls() {
+  const z = car.zone, up = z.up, lo = z.lo;
+  const fx = Math.cos(car.a), fy = Math.sin(car.a);
+  for (const off of COFF) {
+    const px = car.x + fx * off, py = car.y + fy * off;
+    const U = segNearest(up, px, py, z.ku - z.ru, z.ku + z.ru);
+    const dU = U.d, ux = U.x, uy = U.y;
+    if (car.upper) {
+      const lim = up.half + 1 - CR;
+      if (dU > lim) resolveStatic(px, py, (ux - px) / dU, (uy - py) / dU, dU - lim, 0.2, 0.01);
+      continue;
+    }
+    const wall = up.half + 2 + CR;
+    if (dU >= wall) continue;
+    const L = segNearest(lo, px, py, z.kl - z.rl, z.kl + z.rl);
+    const corr = lo.half + lo.sh + UNDERPASS_CLEAR - CR;
+    if (L.d <= corr) continue;
+    const penU = wall - dU, penL = L.d - corr;
+    if (penU < penL && dU > 1e-3) resolveStatic(px, py, (px - ux) / dU, (py - uy) / dU, penU, 0.25, 0.01);
+    else resolveStatic(px, py, (L.x - px) / L.d, (L.y - py) / L.d, penL, 0.25, 0.01);
   }
 }
 
@@ -716,7 +822,7 @@ function physics(dt) {
 }
 
 // Stoß zwischen Auto (Kollisionskreis bei px,py) und unbeweglichem Hindernis; n zeigt vom Hindernis zum Auto
-function resolveStatic(px, py, nx, ny, pen, e) {
+function resolveStatic(px, py, nx, ny, pen, e, fric = 0.08) {
   car.x += nx * pen; car.y += ny * pen;
   const ox = px - car.x, oy = py - car.y;
   const vpx = car.vx - car.w * oy, vpy = car.vy + car.w * ox;
@@ -727,11 +833,13 @@ function resolveStatic(px, py, nx, ny, pen, e) {
   car.vx += j * nx; car.vy += j * ny;
   car.w += rn * j * INV_I;
   const tx = -ny, ty = nx, vt = car.vx * tx + car.vy * ty;
-  car.vx -= tx * vt * 0.08; car.vy -= ty * vt * 0.08;
+  car.vx -= tx * vt * fric; car.vy -= ty * vt * fric;
   impactAcc = Math.max(impactAcc, -vn);
 }
 
 function collide() {
+  if (car.zone) crossingWalls();
+  if (car.upper) return; // auf der Brücke gibt es nichts, woran man stoßen könnte
   const fx = Math.cos(car.a), fy = Math.sin(car.a);
   for (const off of COFF) {
     const px = car.x + fx * off, py = car.y + fy * off;
@@ -1022,6 +1130,21 @@ function drawDyn(o) {
   ctx.restore();
 }
 
+function drawDeck(z) {
+  const s = z.up, r = Math.ceil(z.span / s.step), k0 = z.ku - r, k1 = z.ku + r;
+  const p = k => k >= k0 && k <= k1;
+  ctx.lineJoin = 'round'; ctx.lineCap = 'butt';
+  ctx.save(); ctx.translate(12, 15);
+  polyLine(ctx, s, 0, s.half * 2 + 8, 'rgba(0,0,0,0.32)', null, p);
+  ctx.restore();
+  polyLine(ctx, s, 0, (s.half + 4) * 2, '#8b8e94', null, p);   // Brückenkante (Beton)
+  polyLine(ctx, s, 0, s.half * 2, s.col, null, p);
+  drawMarkings(ctx, s, p);
+  polyLine(ctx, s, -(s.half + 2.5), 3, '#dcd6c8', null, p);    // Geländer
+  polyLine(ctx, s, s.half + 2.5, 3, '#dcd6c8', null, p);
+  ctx.setLineDash([]);
+}
+
 function rrect(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); ctx.fill(); }
 
 function drawCar() {
@@ -1092,7 +1215,16 @@ function render() {
   for (const o of highs) drawShadow(o);
   for (const o of lows) drawStatic(o);
   for (const o of dyns) drawDyn(o);
-  drawCar();
+  if (!car.upper) drawCar();
+  const decks = new Set();
+  for (let cy = Math.floor(by0 / CS); cy <= Math.floor(by1 / CS); cy++) {
+    for (let cx = Math.floor(bx0 / CS); cx <= Math.floor(bx1 / CS); cx++) {
+      const c = chunks.get(ckey(cx, cy));
+      if (c && c.done) for (const z of c.crossings) decks.add(z);
+    }
+  }
+  for (const z of decks) drawDeck(z);
+  if (car.upper) drawCar();
   for (const q of particles) {
     ctx.fillStyle = q.color + (0.55 * q.life / q.max).toFixed(3) + ')';
     circle(q.x, q.y, q.size);
@@ -1171,9 +1303,14 @@ function updateHud() {
   const s = surfAtFast(car.x, car.y);
   const R = roadQuery(car.x, car.y, segsNear(car.x, car.y, car.x, car.y));
   let name = SURF[s].name, col = SURF[s].rgb;
-  if (R.seg && R.edge < 0) {
-    name = RT[R.seg.type].name + (s === S_BRIDGE ? ' · Brücke' : '');
-    if (R.seg.type !== 'track') col = [86, 88, 94];
+  let road = R.seg && R.edge < 0 ? R.seg : null, extra = s === S_BRIDGE ? ' · Brücke' : '';
+  const z = car.zone;
+  if (z && car.upper) { road = z.up; extra = ' · Überführung'; }
+  else if (z && segNearest(z.lo, car.x, car.y, z.kl - z.rl, z.kl + z.rl).d < z.lo.half &&
+           segNearest(z.up, car.x, car.y, z.ku - z.ru, z.ku + z.ru).d < z.up.half) { road = z.lo; extra = ' · Unterführung'; }
+  if (road) {
+    name = RT[road.type].name + extra;
+    col = road.type === 'track' ? SURF[S_GRAVEL].rgb : [86, 88, 94];
   }
   if (name !== hudName) {
     hudName = name;
@@ -1210,6 +1347,8 @@ function newWorld(seed) {
   document.getElementById('seed').textContent = seed;
   chunks.clear();
   segCache.clear();
+  crossCache.clear();
+  car.zone = null; car.upper = false;
   particles.length = 0;
   spawn = findSpawn();
   Object.assign(car, { x: spawn.x, y: spawn.y, a: spawn.a, vx: 0, vy: 0, w: 0, steer: 0, vf: 0, vl: 0 });
