@@ -53,6 +53,7 @@
   <div><b>← → / A D</b>Lenken</div>
   <div><b>Leertaste</b>Handbremse</div>
   <div><b>R</b>Neue Welt &nbsp; <b style="min-width:0">C</b> Farbe &nbsp; <b style="min-width:0">H</b> Hilfe</div>
+  <div><b>N</b>Nacht an/aus</div>
 </div>
 
 <div id="intro"><div><h1>Kleiner Flitzer</h1><p>Drück eine Taste und fahr los</p></div></div>
@@ -717,6 +718,28 @@ function urbanGround(s, x, y, cold) {
   return hash(a, b, s.id) < 0.1 ? green : S_URBAN;                                   // Park oder bebaut
 }
 
+// Straßenlaternen: abwechselnd an beiden Straßenseiten, auf Autobahnen im Mittelstreifen
+function settlementLamps(s) {
+  if (s.lamps) return s.lamps;
+  const L = s.lamps = [], own = new Set(streetsOf(s));
+  for (const v of segsNear(s.x - s.R, s.y - s.R, s.x + s.R, s.y + s.R)) {
+    const g = v.seg;
+    if (g.type === 'track' || (g.net === 3 && !own.has(g))) continue;
+    const spacing = g.net === 0 ? 150 : s.kind === 'village' ? 130 : 100;
+    const step = Math.max(1, Math.round(spacing / g.step));
+    let side = 1;
+    for (let k = v.i0; k <= v.i1; k += step) {
+      if (Math.hypot(g.xs[k] - s.x, g.ys[k] - s.y) > s.R * (own.has(g) ? 1.05 : 1)) continue;
+      side = -side;
+      const off = g.net === 0 ? 0 : (g.half + g.sh * 0.6 + 3) * side;
+      const x = g.xs[k] + g.nx[k] * off, y = g.ys[k] + g.ny[k] * off;
+      // an Kreuzungen treffen mehrere Straßen zusammen: Mindestabstand gegen Lichthäufung
+      if (!L.some(l => Math.abs(l.x - x) < 55 && Math.abs(l.y - y) < 55)) L.push({ x, y });
+    }
+  }
+  return L;
+}
+
 // Gebäude einer Siedlung, beim ersten Bedarf erzeugt
 const CITY_ROOFS = ['#8d9096', '#a3a39e', '#7d828a', '#b5aea2', '#6f7b88', '#9c8f80', '#c0b9ac'];
 function settlementBuildings(s) {
@@ -1299,6 +1322,7 @@ addEventListener('keydown', e => {
   if (e.code === 'KeyR') newWorld(Math.floor(Math.random() * 999999) + 1);
   if (e.code === 'KeyC') car.color = (car.color + 1) % CAR_COLORS.length;
   if (e.code === 'KeyH') document.getElementById('help').classList.toggle('hidden');
+  if (e.code === 'KeyN') night = !night;
 });
 addEventListener('keyup', e => { if (KEYMAP[e.code]) keys[KEYMAP[e.code]] = false; });
 addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
@@ -2144,6 +2168,82 @@ function render() {
     circle(q.x, q.y, q.size);
   }
   for (const o of highs) drawStatic(o);
+
+  const lamps = [];
+  for (const s of settlementsNear(bx0, by0, bx1, by1))
+    for (const l of settlementLamps(s)) if (l.x > bx0 && l.x < bx1 && l.y > by0 && l.y < by1) lamps.push(l);
+  ctx.fillStyle = '#4a4d52';
+  for (const l of lamps) circle(l.x, l.y, 2.6);                        // Laternenmasten
+  if (nightLevel > 0.01) drawNight(lamps);
+}
+
+// ---------- Nacht ----------
+// Über die fertige Szene kommt eine dunkle Lichtkarte, aus der Scheinwerfer und Laternen
+// herausgeschnitten werden; danach warmes Licht additiv obendrauf.
+let night = false, nightLevel = 0;
+const lightCv = document.createElement('canvas'), lctx = lightCv.getContext('2d');
+const LAMP_R = 90;
+function radial(g, x, y, r, stops) {
+  const gr = g.createRadialGradient(x, y, 0, x, y, r);
+  for (const [o, c] of stops) gr.addColorStop(o, c);
+  g.fillStyle = gr;
+}
+// Zwei Lichtkegel nach vorn (bzw. ein kurzer nach hinten beim Rückwärtsfahren). Jeder Kegel
+// besteht aus übereinanderliegenden Schichten, nach außen breiter und kürzer, damit das Licht
+// am Rand und am Ende weich ausläuft. additive: Schichten summieren sich (Lichtfarbe);
+// sonst decken sie wie beim Ausschneiden aus der Dunkelheit (1 - (1-a)^n).
+const BEAM_LAYERS = 16;
+function beam(g, col, ox, oy, a, L, spread, peak, per) {
+  for (let i = 1; i <= BEAM_LAYERS; i++) {
+    const f = i / BEAM_LAYERS, sp = spread * (0.25 + 0.75 * f), len = L * (1 - 0.3 * f);
+    radial(g, ox, oy, len, [[0, col(peak * per)], [0.45, col(peak * 0.7 * per)], [1, col(0)]]);
+    g.beginPath(); g.moveTo(ox, oy); g.arc(ox, oy, len, a - sp, a + sp); g.closePath(); g.fill();
+  }
+}
+function carLights(g, col, additive) {
+  const per = additive ? 1 / BEAM_LAYERS : 1 - Math.pow(0.05, 1 / BEAM_LAYERS);
+  const fx = Math.cos(car.a), fy = Math.sin(car.a), rx = -fy, ry = fx;
+  for (const sd of [-1, 1])
+    beam(g, col, car.x + fx * 22 + rx * 8 * sd, car.y + fy * 22 + ry * 8 * sd, car.a + sd * 0.04, 340, 0.5, 1, per);
+  if (car.reversing) beam(g, col, car.x - fx * 24, car.y - fy * 24, car.a + Math.PI, 120, 0.7, 0.75, per);
+}
+function drawNight(lamps) {
+  if (lightCv.width !== cv.width || lightCv.height !== cv.height) { lightCv.width = cv.width; lightCv.height = cv.height; }
+  const g = lctx, T = ctx.getTransform();
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalCompositeOperation = 'source-over';
+  g.clearRect(0, 0, lightCv.width, lightCv.height);
+  g.fillStyle = `rgba(6,10,26,${(0.9 * nightLevel).toFixed(3)})`;
+  g.fillRect(0, 0, lightCv.width, lightCv.height);
+  g.setTransform(T);
+  g.globalCompositeOperation = 'destination-out';
+  for (const l of lamps) {
+    radial(g, l.x, l.y, LAMP_R, [[0, 'rgba(0,0,0,0.95)'], [0.5, 'rgba(0,0,0,0.6)'], [1, 'rgba(0,0,0,0)']]);
+    g.beginPath(); g.arc(l.x, l.y, LAMP_R, 0, TAU); g.fill();
+  }
+  carLights(g, a => `rgba(0,0,0,${a.toFixed(4)})`, false);
+  radial(g, car.x, car.y, 45, [[0, 'rgba(0,0,0,0.5)'], [1, 'rgba(0,0,0,0)']]);  // Schein ums Auto
+  g.beginPath(); g.arc(car.x, car.y, 45, 0, TAU); g.fill();
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(lightCv, 0, 0);
+  ctx.setTransform(T);
+  ctx.globalCompositeOperation = 'lighter';
+  const k = nightLevel;
+  for (const l of lamps) {
+    radial(ctx, l.x, l.y, LAMP_R * 0.8, [[0, `rgba(255,196,120,${0.22 * k})`], [1, 'rgba(255,196,120,0)']]);
+    ctx.beginPath(); ctx.arc(l.x, l.y, LAMP_R * 0.8, 0, TAU); ctx.fill();
+    ctx.fillStyle = `rgba(255,236,190,${0.9 * k})`; circle(l.x, l.y, 2.2);
+  }
+  carLights(ctx, a => `rgba(255,244,214,${(a * 0.16 * k).toFixed(4)})`, true);
+  const fx = Math.cos(car.a), fy = Math.sin(car.a);
+  const tail = car.braking ? 0.75 : 0.35;                                  // Rücklichter
+  for (const sd of [-1, 1]) {
+    const x = car.x - fx * 23 - fy * 7.5 * sd, y = car.y - fy * 23 + fx * 7.5 * sd;
+    radial(ctx, x, y, 14, [[0, `rgba(255,40,30,${tail * k})`], [1, 'rgba(255,40,30,0)']]);
+    ctx.beginPath(); ctx.arc(x, y, 14, 0, TAU); ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
 }
 
 // ---------- Minikarte ----------
@@ -2303,6 +2403,7 @@ function frame(now) {
   updateDyn(dt);
   effects(dt);
   updateCamera(dt);
+  nightLevel += ((night ? 1 : 0) - nightLevel) * Math.min(1, dt * 2.5);
 
   ensureChunks();
   workChunks(6);
