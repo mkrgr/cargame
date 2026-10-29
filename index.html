@@ -113,7 +113,7 @@ function mulberry32(a) {
 // ---------- Untergründe ----------
 const S_DEEP = 0, S_SHALLOW = 1, S_ASPHALT = 2, S_GRAVEL = 3, S_GRASS = 4, S_SAND = 5,
       S_MUD = 6, S_SNOW = 7, S_ICE = 8, S_BRIDGE = 9, S_DENSE = 10, S_ROCK = 11, S_CLIFF = 12,
-      S_PASTURE = 13, S_WHEAT = 14, S_CORN = 15, S_PLOW = 16, S_URBAN = 17;
+      S_PASTURE = 13, S_WHEAT = 14, S_CORN = 15, S_PLOW = 16, S_URBAN = 17, S_RAIL = 18;
 // grip: Seitenhaftung, accel/top: Anteil an Motorleistung/Höchstgeschwindigkeit, drag: Rollwiderstand, brake: Bremswirkung
 const SURF = [
   { name: 'Tiefes Wasser',  rgb: [34, 86, 140],   grip: 3,   accel: .4,  top: .4,  drag: 1.6, brake: .6, solid: true },
@@ -134,6 +134,7 @@ const SURF = [
   { name: 'Maisfeld',       rgb: [86, 128, 48],   grip: 3.6, accel: .5,  top: .45, drag: 1.6, brake: .8, track: 'rgba(52,72,26,0.42)', dust: 'rgba(120,160,64,' },
   { name: 'Acker',          rgb: [122, 92, 62],   grip: 3.2, accel: .55, top: .55, drag: 1.1, brake: .7, track: 'rgba(70,50,30,0.35)', dust: 'rgba(146,114,82,' },
   { name: 'Pflaster',       rgb: [156, 152, 144], grip: 8,   accel: 1,   top: .9,  drag: .15, brake: 1,  skid: 'rgba(30,30,30,0.3)' },
+  { name: 'Gleisbett',      rgb: [128, 118, 104], grip: 4.5, accel: .7,  top: .6,  drag: .6,  brake: .8, dust: 'rgba(150,140,125,', dustSlipOnly: true },
 ];
 
 let lastE = 0, lastM = 0, lastH = 0, lastCold = false, lastPW = 0;
@@ -544,7 +545,109 @@ function roadQuery(x, y, views) {
   return RQ;
 }
 
-function surfaceAt(x, y, views, setl, rivs) {
+// ---------- Eisenbahn ----------
+// Eigenes grobes Raster: wo eine Gitterzeile oder -spalte Gleise hat, laufen sie durchgehend
+// durch die ganze Welt. So können Züge eine Strecke ohne Ende befahren.
+const RAIL = { cell: 5200, jit: 0.18 }, RAIL_HALF = 11, RAIL_GAUGE = 4.5;
+const railCache = new Map();
+function railNode(i, j) {
+  return [(i + .5 + (hash(i, j, SEED + 801) - .5) * 2 * RAIL.jit) * RAIL.cell,
+          (j + .5 + (hash(i, j, SEED + 802) - .5) * 2 * RAIL.jit) * RAIL.cell];
+}
+const railRow = j => hash(0, j, SEED + 803) < 0.35, railCol = i => hash(i, 0, SEED + 804) < 0.35;
+function railTangent(i, j, dir) {
+  const a = railNode(dir ? i : i - 1, dir ? j - 1 : j), b = railNode(dir ? i : i + 1, dir ? j + 1 : j);
+  const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy);
+  return [dx / l, dy / l];
+}
+function railSeg(i, j, dir) {
+  const key = i + '|' + j + '|' + dir;
+  let s = railCache.get(key);
+  if (s !== undefined) return s;
+  s = null;
+  if (dir ? railCol(i) : railRow(j)) {
+    const i2 = dir ? i : i + 1, j2 = dir ? j + 1 : j;
+    const A = railNode(i, j), B = railNode(i2, j2), tA = railTangent(i, j, dir), tB = railTangent(i2, j2, dir);
+    const len = Math.hypot(B[0] - A[0], B[1] - A[1]), k = len * 0.36;
+    const P1 = [A[0] + tA[0] * k, A[1] + tA[1] * k], P2 = [B[0] - tB[0] * k, B[1] - tB[1] * k];
+    const n = Math.ceil(len / 14) + 1;
+    const xs = new Float32Array(n), ys = new Float32Array(n), nx = new Float32Array(n), ny = new Float32Array(n);
+    const cum = new Float32Array(n), water = new Uint8Array(n);
+    let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9, wet = 0;
+    for (let q = 0; q < n; q++) {
+      const t = q / (n - 1), u = 1 - t, b0 = u * u * u, b1 = 3 * u * u * t, b2 = 3 * u * t * t, b3 = t * t * t;
+      xs[q] = b0 * A[0] + b1 * P1[0] + b2 * P2[0] + b3 * B[0];
+      ys[q] = b0 * A[1] + b1 * P1[1] + b2 * P2[1] + b3 * B[1];
+      if (q) cum[q] = cum[q - 1] + Math.hypot(xs[q] - xs[q - 1], ys[q] - ys[q - 1]);
+      if (isWater(xs[q], ys[q])) { water[q] = 1; wet++; }
+      minx = Math.min(minx, xs[q]); maxx = Math.max(maxx, xs[q]); miny = Math.min(miny, ys[q]); maxy = Math.max(maxy, ys[q]);
+    }
+    for (let q = 0; q < n; q++) {
+      const a = Math.max(0, q - 1), b = Math.min(n - 1, q + 1);
+      const tx = xs[b] - xs[a], ty = ys[b] - ys[a], l = Math.hypot(tx, ty) || 1;
+      nx[q] = -ty / l; ny[q] = tx / l;
+    }
+    s = { key, i, j, dir, xs, ys, nx, ny, cum, len: cum[n - 1], water, hasWater: wet > 0, n, minx, miny, maxx, maxy, half: RAIL_HALF };
+  }
+  railCache.set(key, s);
+  return s;
+}
+function railsNear(x0, y0, x1, y1) {
+  const out = [], C = RAIL.cell, m = RAIL_HALF + 60;
+  for (let j = Math.floor(y0 / C) - 2; j <= Math.floor(y1 / C) + 1; j++)
+    for (let i = Math.floor(x0 / C) - 2; i <= Math.floor(x1 / C) + 1; i++)
+      for (let dir = 0; dir < 2; dir++) {
+        const s = railSeg(i, j, dir);
+        if (!s || s.maxx < x0 - m || s.minx > x1 + m || s.maxy < y0 - m || s.miny > y1 + m) continue;
+        let i0 = -1, i1 = -1;
+        for (let k = 0; k < s.n; k++) {
+          const x = s.xs[k], y = s.ys[k];
+          if (x >= x0 - m && x <= x1 + m && y >= y0 - m && y <= y1 + m) { if (i0 < 0) i0 = k; i1 = k; }
+        }
+        if (i0 >= 0) out.push({ seg: s, i0: Math.max(0, i0 - 1), i1: Math.min(s.n - 1, i1 + 1) });
+      }
+  return out;
+}
+const NO_RAILS = [];
+const RRQ = { edge: 1e9, seg: null, k: 0 };
+function railQuery(x, y, views) {
+  RRQ.edge = 1e9; RRQ.seg = null;
+  for (const v of views) {
+    const s = v.seg;
+    if (x < s.minx - 40 || x > s.maxx + 40 || y < s.miny - 40 || y > s.maxy + 40) continue;
+    for (let k = v.i0; k < v.i1; k++) {
+      const ax = s.xs[k], ay = s.ys[k];
+      if (Math.abs(x - ax) > 40 || Math.abs(y - ay) > 40) continue;
+      const bx = s.xs[k + 1] - ax, by = s.ys[k + 1] - ay;
+      const t = clamp(((x - ax) * bx + (y - ay) * by) / (bx * bx + by * by), 0, 1);
+      const d = Math.hypot(x - ax - bx * t, y - ay - by * t) - RAIL_HALF;
+      if (d < RRQ.edge) { RRQ.edge = d; RRQ.seg = s; RRQ.k = t < .5 ? k : k + 1; }
+    }
+  }
+  return RRQ;
+}
+// Schnittpunkte zweier Polylinien (mit Index des Teilstücks in beiden)
+function polyCross(a, b) {
+  const out = [];
+  if (a.maxx < b.minx || a.minx > b.maxx || a.maxy < b.miny || a.miny > b.maxy) return out;
+  for (let i = 0; i < a.n - 1; i++) {
+    const ax = a.xs[i], ay = a.ys[i], bx = a.xs[i + 1], by = a.ys[i + 1];
+    if (Math.max(ax, bx) < b.minx || Math.min(ax, bx) > b.maxx || Math.max(ay, by) < b.miny || Math.min(ay, by) > b.maxy) continue;
+    for (let j = 0; j < b.n - 1; j++) {
+      const cx = b.xs[j], cy = b.ys[j], dx = b.xs[j + 1], dy = b.ys[j + 1];
+      if (Math.min(cx, dx) > Math.max(ax, bx) || Math.max(cx, dx) < Math.min(ax, bx) ||
+          Math.min(cy, dy) > Math.max(ay, by) || Math.max(cy, dy) < Math.min(ay, by)) continue;
+      const rX = bx - ax, rY = by - ay, sX = dx - cx, sY = dy - cy, den = rX * sY - rY * sX;
+      if (Math.abs(den) < 1e-9) continue;
+      const tt = ((cx - ax) * sY - (cy - ay) * sX) / den, u = ((cx - ax) * rY - (cy - ay) * rX) / den;
+      if (tt < 0 || tt > 1 || u < 0 || u > 1) continue;
+      out.push({ x: ax + rX * tt, y: ay + rY * tt, ia: i, ib: j });
+    }
+  }
+  return out;
+}
+
+function surfaceAt(x, y, views, setl, rivs, rails) {
   const list = setl || settlementsNear(x, y, x, y);
   const e = elev(x, y), h = mtnH(x, y, list);
   const S = setlQuery(x, y, list), town = S.s, sf = town ? S.f : 99;
@@ -560,6 +663,9 @@ function surfaceAt(x, y, views, setl, rivs) {
     if (R.edge < R.seg.sh && !water) return R.seg.type === 'street' ? S_URBAN : S_GRAVEL;
     verge = R.seg.type === 'track' && R.edge < TRACK_VERGE;
   }
+  const Rr = railQuery(x, y, rails || railsNear(x, y, x, y));          // Gleise: Bett, über Wasser Brücke
+  if (Rr.seg && Rr.edge < 0) return water ? S_BRIDGE : S_RAIL;
+  if (Rr.seg && Rr.edge < 6 && !water) return S_GRAVEL;
   if (river) {                                                      // Flusswasser: Tiefe für die Färbung
     lastE = deepRiver ? WD - 0.06 * (1 - Rv.dist / (rivHw * 0.6)) : WD + (WL - WD) * clamp(Rv.dist / rivHw, 0, 1);
     return cold ? S_ICE : deepRiver ? S_DEEP : S_SHALLOW;
@@ -857,6 +963,7 @@ function settlementBuildings(s) {
   const views = segsNear(s.x - s.R - 100, s.y - s.R - 100, s.x + s.R + 100, s.y + s.R + 100);
   // frei von Straßen und, wenn gewünscht, von anderen Gebäuden
   const rivs = riversNear(s.x - s.R - 100, s.y - s.R - 100, s.x + s.R + 100, s.y + s.R + 100);
+  const railV = railsNear(s.x - s.R - 100, s.y - s.R - 100, s.x + s.R + 100, s.y + s.R + 100);
   const clearOf = (x, y, w, h, ang, pad, checkOverlap) => {
     const c = Math.cos(ang), sn = Math.sin(ang);
     for (const [u, v] of [[0, 0], [-w / 2, -h / 2], [w / 2, -h / 2], [-w / 2, h / 2], [w / 2, h / 2]]) {
@@ -864,6 +971,7 @@ function settlementBuildings(s) {
       const R = roadQuery(px, py, views);
       if (R.seg && R.edge - R.seg.sh < pad) return false;
       if (rivs.length && riverQuery(px, py, rivs).edge < pad + 6) return false;   // Abstand zum Ufer
+      if (railV.length && railQuery(px, py, railV).edge < pad + 10) return false; // Abstand zu den Gleisen
     }
     const r = Math.hypot(w, h) / 2;
     return !checkOverlap || !B.some(o => Math.hypot(o.x - x, o.y - y) < (o.r + r) * 0.85);
@@ -969,10 +1077,11 @@ function newChunk(cx, cy) {
   const segs = segsNear(cx * CS, cy * CS, (cx + 1) * CS, (cy + 1) * CS);
   const setl = settlementsNear(cx * CS, cy * CS, (cx + 1) * CS, (cy + 1) * CS);
   const rivs = riversNear(cx * CS, cy * CS, (cx + 1) * CS, (cy + 1) * CS);
-  const s = surfaceAt((cx + .5) * CS, (cy + .5) * CS, segs, setl, rivs);
+  const rails = railsNear(cx * CS, cy * CS, (cx + 1) * CS, (cy + 1) * CS);
+  const s = surfaceAt((cx + .5) * CS, (cy + .5) * CS, segs, setl, rivs, rails);
   const p = SURF[s].rgb;
   return {
-    cx, cy, segs, setl, rivs, done: false, row: 0, lastUsed: frameNo,
+    cx, cy, segs, setl, rivs, rails, levels: [], railDecks: [], done: false, row: 0, lastUsed: frameNo,
     roofImg: segs.some(v => v.seg.tunnels.length) ? new ImageData(CN, CN) : null, roof: null,
     surf: new Uint8Array(CN * CN), img: new ImageData(CN, CN),
     canvas: null, statics: [], dyn: [],
@@ -986,7 +1095,7 @@ function genRows(c, n) {
   for (let j = c.row; j < end; j++) {
     for (let i = 0; i < CN; i++) {
       const wx = ox + (i + .5) * CELL, wy = oy + (j + .5) * CELL;
-      const s = surfaceAt(wx, wy, c.segs, c.setl, c.rivs);
+      const s = surfaceAt(wx, wy, c.segs, c.setl, c.rivs, c.rails);
       const idx = j * CN + i;
       c.surf[idx] = s;
       shadeCell(c, s, wx, wy, i, j, d, idx * 4);
@@ -1020,18 +1129,9 @@ function shadeCell(c, s, wx, wy, i, j, d, o) {
     r += k * 130; g += k * 30; b -= k * 20;
   } else if (s === S_ICE) {
     v = 0.95 + 0.1 * n1 + 0.12 * (lf - .5);
-  } else if (s === S_DENSE) {
-    const cr = crownAt(wx, wy);
-    v = 0.45 + 0.75 * Math.sqrt(cr.shade);
-    if (lastCold) {
-      r = 34; g = 72; b = 60;
-      if (cr.shade > 0.55 && cr.id > 0.4) { r = 214; g = 222; b = 230; } // Schnee auf den Kronen
-    } else if (autumnAt(wx, wy)) {
-      const pal = [[176, 84, 34], [196, 140, 40], [150, 52, 36], [96, 112, 46]];
-      [r, g, b] = pal[Math.floor(cr.id * pal.length)];
-    } else {
-      g = 76 + 30 * cr.id; r = 30 + 18 * cr.id;
-    }
+  } else if (s === S_DENSE) {                     // Waldboden zwischen den Kronen
+    if (lastCold) { r = 120; g = 132; b = 140; } else { r = 30; g = 44; b = 24; }
+    v = 0.8 + 0.4 * n1 * lf;
   } else if (s === S_URBAN) {                     // Gehwegplatten
     v = 0.95 + 0.05 * n1 + 0.06 * (lf - .5);
   } else if (s === S_WHEAT) {                     // Saatreihen quer zur Parzelle
@@ -1050,6 +1150,59 @@ function shadeCell(c, s, wx, wy, i, j, d, o) {
     lastH = hh;
   }
   d[o] = clamp(r * v, 0, 255); d[o + 1] = clamp(g * v, 0, 255); d[o + 2] = clamp(b * v, 0, 255); d[o + 3] = 255;
+}
+
+// Gleise: Schotterbett und Schwellen nur abseits der Straßen, Schienen auch über die Fahrbahn
+// (Bahnübergang), aber nicht unter Autobahnen (die überqueren die Bahn auf Brücken)
+function drawRails(c) {
+  const g = c.ctx;
+  g.save(); g.translate(-c.cx * CS, -c.cy * CS); g.lineJoin = 'round'; g.lineCap = 'butt';
+  for (const v of c.rails) {
+    const s = v.seg, onRoad = new Uint8Array(s.n), underHw = new Uint8Array(s.n);
+    for (let k = v.i0; k <= v.i1; k++) {
+      const R = roadQuery(s.xs[k], s.ys[k], c.segs);
+      if (R.seg && R.edge < (R.seg.net === 0 ? R.seg.sh : 2)) { onRoad[k] = 1; if (R.seg.net === 0) underHw[k] = 1; }
+    }
+    const wet = k => s.water[k] || s.water[k - 1] || s.water[k + 1];
+    const bed = k => !onRoad[k] && !s.water[k], rails = k => !underHw[k];
+    if (s.hasWater) {                                                // Brückenschatten
+      g.save(); g.translate(6, 8); polyLine(g, s, 0, RAIL_HALF * 2 + 2, 'rgba(0,0,0,0.28)', null, wet); g.restore();
+      polyLine(g, s, 0, RAIL_HALF * 2, '#5d4a38', null, k => wet(k) && !underHw[k]);
+    }
+    polyLine(g, s, 0, RAIL_HALF * 2, '#8a8174', null, bed);          // Schotter
+    polyLine(g, s, 0, RAIL_HALF * 2 - 4, '#9a9183', null, bed);
+    polyLine(g, s, 0, 15, '#4b3a2c', [2.6, 3.6], k => bed(k) || (wet(k) && !underHw[k]));   // Schwellen
+    for (const sd of [-1, 1]) {
+      polyLine(g, s, sd * RAIL_GAUGE, 1.8, '#7d838a', null, rails);  // Schienen
+      polyLine(g, s, sd * RAIL_GAUGE - 0.4, 0.7, '#c8ccd0', null, rails);
+    }
+    if (s.hasWater) for (const sd of [-1, 1]) polyLine(g, s, sd * (RAIL_HALF + 1), 2.5, '#d9d3c5', null, k => wet(k) && !underHw[k]);
+  }
+  g.setLineDash([]); g.restore();
+}
+// Bahnübergänge (Land-, Neben-, Stadtstraßen, Waldwege) und Autobahnbrücken über die Bahn
+const levelCache = new Map();
+function findRailCrossings(c) {
+  for (const rv of c.rails) for (const sv of c.segs) {
+    const r = rv.seg, s = sv.seg;
+    for (const p of polyCross(r, s)) {
+      if (p.x < c.cx * CS - 200 || p.x > (c.cx + 1) * CS + 200 || p.y < c.cy * CS - 200 || p.y > (c.cy + 1) * CS + 200) continue;
+      const key = Math.round(p.x / 30) + '|' + Math.round(p.y / 30) + '|' + s.net;
+      let L = levelCache.get(key);
+      if (!L) {
+        const sin = Math.max(0.35, Math.abs(r.nx[p.ia] * s.ny[p.ib] - r.ny[p.ia] * s.nx[p.ib]));
+        if (s.net === 0) {                                           // Autobahn auf einer Brücke über die Bahn
+          L = { deck: true, x: p.x, y: p.y, span: (RAIL_HALF + 14) / sin + 16, upV: chainViews(s, p.x, p.y, 600) };
+        } else {
+          const barrier = s.type === 'road' || (s.type === 'street' && s.skind !== 'village');
+          L = { deck: false, x: p.x, y: p.y, seg: s, k: p.ib, barrier, closed: 0, sin };
+        }
+        levelCache.set(key, L);
+      }
+      const list = L.deck ? c.railDecks : c.levels;
+      if (!list.includes(L)) list.push(L);
+    }
+  }
 }
 
 // Felsdach über Tunneln: Tunnelverlauf als Maske, gefüllt mit dem Gelände ohne Straße
@@ -1087,6 +1240,8 @@ function finalizeChunk(c) {
   c.img = null;
   drawRoads(c);
   if (c.roofImg) { buildRoof(c); c.roofImg = null; }
+  if (c.rails.length) { drawRails(c); findRailCrossings(c); }
+  buildCanopy(c);
   c.crossings = [];
   const segs = c.segs.map(v => v.seg);
   for (const a of segs) if (a.net === 0) for (const b of segs) if (b.net !== 0) {
@@ -1217,9 +1372,127 @@ function drawRoads(c) {
   g.restore();
 }
 
+// ---------- Wald ----------
+// Jeder Punkt eines 20-px-Gitters im dichten Wald trägt eine Baumkrone: Laubbäume als wolkige
+// Kronen aus mehreren Teilen, Nadelbäume als Sterne in drei Ebenen. Kronen im Inneren werden
+// einmal in den Boden des Chunks gemalt; Randkronen und der vorgelagerte Waldmantel liegen als
+// Overlay über allem (auch über dem Auto) – ohne Kollision, fest bleibt nur der Wald selbst.
+const FOREST_G = 20;
+const AUTUMN_PAL = [[176, 84, 34], [196, 140, 40], [150, 52, 36], [96, 112, 46]];
+function forestCrown(gx, gy, x, y, scale) {
+  const h1 = hash(gx, gy, SEED + 13), id = Math.floor(hash(gx, gy, SEED + 14) * 4) / 4, h3 = hash(gx, gy, SEED + 15);
+  const cold = fbm(x / 2400, y / 2400, SEED + 31, 3) < 0.39, aut = !cold && autumnAt(x, y);
+  const conifer = cold ? h3 < 0.85 : h3 < (aut ? 0.2 : 0.3);
+  const rr = FOREST_G * (0.7 + 0.5 * h1) * scale;
+  let col, key;
+  if (conifer) { col = cold ? [30, 66, 56] : [26 + 10 * id, 62 + 14 * id, 42]; key = 'c' + (cold ? 'w' : '') + id; }
+  else if (cold) { col = [112 + 20 * id, 104 + 16 * id, 92]; key = 'b' + id; }       // kahle Laubbäume im Winter
+  else if (aut) { const q = Math.floor(hash(gx, gy, SEED + 17) * 4); col = AUTUMN_PAL[q]; key = 'a' + q; }
+  else { col = [32 + 26 * id, 86 + 34 * id, 40]; key = 'd' + id; }
+  const blobs = [];
+  if (!conifer) {
+    const n = 4 + Math.floor(h3 * 3), a0 = h1 * TAU;
+    blobs.push([x, y, rr * 0.62]);
+    for (let k = 0; k < n; k++) {
+      const a = a0 + k / n * TAU + hash(gx, gy, SEED + 20 + k) * 0.5;
+      blobs.push([x + Math.cos(a) * rr * 0.42, y + Math.sin(a) * rr * 0.42, rr * (0.48 + 0.14 * hash(gx, gy, SEED + 30 + k))]);
+    }
+  }
+  return { x, y, rr, conifer, cold, col, key, blobs, rot: h1 * TAU };
+}
+// Pfadgruppen je Farbton: Grundform, Mittelton, Lichter, Schnee
+function crownGroup(groups, cr) {
+  let g = groups.get(cr.key);
+  if (!g) {
+    const f = m => `rgb(${clamp(cr.col[0] * m, 0, 255) | 0},${clamp(cr.col[1] * m, 0, 255) | 0},${clamp(cr.col[2] * m, 0, 255) | 0})`;
+    g = { base: new Path2D(), mid: new Path2D(), hi: new Path2D(), snow: new Path2D(), cols: [f(0.72), f(1.0), f(1.32)] };
+    groups.set(cr.key, g);
+  }
+  return g;
+}
+const disc = (p, x, y, r) => { p.moveTo(x + r, y); p.arc(x, y, r, 0, TAU); };
+function star(p, x, y, r, rot, pts) {
+  for (let i = 0; i < pts * 2; i++) {
+    const a = rot + i / (pts * 2) * TAU, rr = i % 2 ? r * 0.62 : r;
+    i ? p.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr) : p.moveTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr);
+  }
+  p.closePath();
+}
+function addCrown(groups, shadow, cr, shOff) {
+  const g = crownGroup(groups, cr), { x, y, rr } = cr;
+  if (cr.conifer) {
+    star(g.base, x, y, rr * 0.95, cr.rot, 8);
+    star(g.mid, x - rr * 0.06, y - rr * 0.06, rr * 0.64, cr.rot + 0.2, 8);
+    star(g.hi, x - rr * 0.1, y - rr * 0.1, rr * 0.32, cr.rot + 0.4, 6);
+    if (cr.cold) for (let k = 0; k < 3; k++) {
+      const a = cr.rot + k * 2.1; disc(g.snow, x + Math.cos(a) * rr * 0.45, y + Math.sin(a) * rr * 0.45, rr * 0.13);
+    }
+    disc(shadow, x + shOff, y + shOff * 1.25, rr * 0.85);
+  } else {
+    for (const [bx, by, br] of cr.blobs) {
+      disc(g.base, bx, by, br);
+      disc(g.mid, bx - rr * 0.1, by - rr * 0.12, br * 0.74);
+      disc(shadow, bx + shOff, by + shOff * 1.25, br);
+    }
+    for (let k = 1; k < Math.min(4, cr.blobs.length); k++) {         // Lichter oben links
+      const [bx, by, br] = cr.blobs[k];
+      disc(g.hi, bx - rr * 0.22, by - rr * 0.25, br * 0.32);
+    }
+  }
+}
+function fillGroups(g2, groups, shadow, shAlpha) {
+  g2.fillStyle = `rgba(0,0,0,${shAlpha})`; g2.fill(shadow);
+  for (const g of groups.values()) {
+    g2.fillStyle = g.cols[0]; g2.fill(g.base);
+    g2.fillStyle = g.cols[1]; g2.fill(g.mid);
+    g2.fillStyle = g.cols[2]; g2.fill(g.hi);
+    g2.fillStyle = 'rgba(232,238,244,0.92)'; g2.fill(g.snow);
+  }
+}
+function buildCanopy(c) {
+  const G = FOREST_G, ox = c.cx * CS, oy = c.cy * CS, M = 30;
+  const dense = (x, y) => localSurf(c, x, y) === S_DENSE;
+  const inner = new Map(), innerSh = new Path2D(), edge = new Map(), edgeSh = new Path2D();
+  let anyInner = false;
+  // Rand mitzeichnen, damit Kronen über Chunkgrenzen nicht abgeschnitten werden
+  for (let gy = Math.floor((oy - M) / G); gy <= Math.floor((oy + CS + M) / G); gy++) {
+    for (let gx = Math.floor((ox - M) / G); gx <= Math.floor((ox + CS + M) / G); gx++) {
+      const px = (gx + hash(gx, gy, SEED + 11)) * G, py = (gy + hash(gx, gy, SEED + 12)) * G;
+      if (px < ox - M || px >= ox + CS + M || py < oy - M || py >= oy + CS + M || !dense(px, py)) continue;
+      let dx = 0, dy = 0, open = 0;
+      for (let k = 0; k < 8; k++) {
+        const a = k * TAU / 8, ax = Math.cos(a), ay = Math.sin(a);
+        if (!dense(px + ax * 24, py + ay * 24)) { dx += ax; dy += ay; open++; }
+      }
+      if (!open) { addCrown(inner, innerSh, forestCrown(gx, gy, px, py, 1.05), 4); anyInner = true; continue; }
+      // Randkrone (nur vom Chunk, in dem sie liegt, ins Overlay)
+      if (px < ox || px >= ox + CS || py < oy || py >= oy + CS) continue;
+      const l = Math.hypot(dx, dy) || 1, ux = dx / l, uy = dy / l;
+      const cr = forestCrown(gx, gy, px + ux * 5, py + uy * 5, 1.12);
+      addCrown(edge, edgeSh, cr, 9);
+      // Waldmantel: Sträucher und junge Bäume vor dem Rand
+      if (open >= 2 && hash(gx, gy, SEED + 18) < 0.55) {
+        const d = cr.rr * 0.9 + 6 + hash(gx, gy, SEED + 19) * 10, sx = px + ux * d, sy = py + uy * d;
+        const R = roadQuery(sx, sy, c.segs);
+        if ((!R.seg || R.edge > 4) && !SURF[localSurf(c, sx, sy)].solid && !isRoadSurf(localSurf(c, sx, sy))) {
+          const sh = forestCrown(gx + 7919, gy, sx, sy, 0.45);
+          sh.col = sh.col.map(v => v * 1.08); sh.key += 's';
+          addCrown(edge, edgeSh, sh, 5);
+        }
+      }
+    }
+  }
+  if (anyInner) {                                                    // Waldinneres fest in den Boden malen
+    const g = c.ctx;
+    g.save(); g.translate(-ox, -oy); fillGroups(g, inner, innerSh, 0.32); g.restore();
+  }
+  c.canopy = edge.size ? { shadow: edgeSh, groups: edge } : null;
+}
+
 function localSurf(c, x, y) {
   const i = Math.floor((x - c.cx * CS) / CELL), j = Math.floor((y - c.cy * CS) / CELL);
-  if (i < 0 || j < 0 || i >= CN || j >= CN) return surfaceAt(x, y);
+  // knapp außerhalb: mit den Listen des Chunks rechnen (die reichen über den Rand hinaus) statt neu zu suchen
+  if (i < 0 || j < 0 || i >= CN || j >= CN) return surfaceAt(x, y, c.segs, c.setl, c.rivs, c.rails);
   return c.surf[j * CN + i];
 }
 
@@ -1235,6 +1508,7 @@ function genObstacles(c) {
       const R = roadQuery(x, y, c.segs);
       const clear = R.seg && R.seg.type === 'track' ? TRACK_VERGE : R.seg ? R.seg.sh : 0;
       if (R.seg && R.edge - clear < r * 0.7 + 3) return false;
+      if (c.rails.length && railQuery(x, y, c.rails).edge < r * 0.7 + 10) return false;
     }
     for (const o of S) if (Math.hypot(o.x - x, o.y - y) < o.r + r + 8) return false;
     for (const o of D) if (Math.hypot(o.x - x, o.y - y) < o.r + r + 4) return false;
@@ -1473,6 +1747,15 @@ function gatherNearby() {
     for (const o of c.statics) if (Math.abs(o.x - car.x) < o.r + 80 && Math.abs(o.y - car.y) < o.r + 80) nearStatics.push(o);
     for (const o of c.dyn) if (Math.abs(o.x - car.x) < 120 && Math.abs(o.y - car.y) < 120) nearDyn.push(o);
   }
+  for (const t of trains) for (const w of t.laid)                    // Züge sind feste Hindernisse
+    if (Math.abs(w.x - car.x) < w.len / 2 + 80 && Math.abs(w.y - car.y) < w.len / 2 + 80)
+      nearStatics.push({ t: 'wagon', x: w.x, y: w.y, w: w.len, h: 14, ang: w.a, r: w.len / 2 });
+  for (const L of nearLevels()) if (L.barrier && L.closed > 0.8)       // geschlossene Schranken
+    for (const P of levelPosts(L)) {
+      if (Math.abs(P.x - car.x) > 120 || Math.abs(P.y - car.y) > 120) continue;
+      nearStatics.push({ t: 'barrier', x: P.x + P.ax * P.len / 2, y: P.y + P.ay * P.len / 2, w: P.len, h: 3,
+                         ang: Math.atan2(P.ay, P.ax), r: P.len / 2 });
+    }
   updateZone();
   const R = roadQuery(car.x, car.y, segsNear(car.x, car.y, car.x, car.y));
   car.inTunnel = !car.upper && !!R.seg && !!R.seg.tunnel && R.edge < R.seg.sh + TUNNEL_EXTRA && !!R.seg.tunnel[R.k];
@@ -2126,6 +2409,158 @@ function effects(dt) {
   }
 }
 
+// ---------- Güterzüge ----------
+// Bis zu zwei Züge fahren auf Strecken in der Nähe des Autos. Position: Segmentindex k entlang
+// der Strecke plus Abstand d darin; Lok und Wagen folgen dahinter auf der Gleiskurve.
+const trains = [];
+let trainSpawn = 0;
+const WAGON_TYPES = ['container', 'tank', 'hopper', 'logs', 'box'];
+const CONTAINER_COLS = ['#2f6db5', '#c8352b', '#e3a33c', '#3d8a4a', '#8e5bc4', '#d9d4c8'];
+const chainSeg = (t, k) => t.dir ? railSeg(t.line, k, 1) : railSeg(k, t.line, 0);
+function railPoint(t, off) {
+  let k = t.k, d = t.d + off, s = chainSeg(t, k);
+  while (d < 0) { k--; s = chainSeg(t, k); d += s.len; }
+  while (d > s.len) { d -= s.len; k++; s = chainSeg(t, k); }
+  let lo = 0, hi = s.n - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (s.cum[m] <= d) lo = m; else hi = m; }
+  const f = (d - s.cum[lo]) / ((s.cum[hi] - s.cum[lo]) || 1);
+  return [s.xs[lo] + (s.xs[hi] - s.xs[lo]) * f, s.ys[lo] + (s.ys[hi] - s.ys[lo]) * f];
+}
+function railNorm(t) {
+  let s = chainSeg(t, t.k);
+  while (t.d < 0) { t.k--; s = chainSeg(t, t.k); t.d += s.len; }
+  while (t.d > s.len) { t.d -= s.len; t.k++; s = chainSeg(t, t.k); }
+}
+// Mittelpunkt und Winkel jedes Fahrzeugs aus seinem Vorder- und Hinterende auf dem Gleis
+function layoutTrain(t) {
+  let acc = 0;
+  t.laid = t.cars.map(w => {
+    const f = railPoint(t, -t.sign * acc), b = railPoint(t, -t.sign * (acc + w.len));
+    acc += w.len + 4;
+    return { ...w, x: (f[0] + b[0]) / 2, y: (f[1] + b[1]) / 2, a: Math.atan2(f[1] - b[1], f[0] - b[0]) };
+  });
+}
+function spawnTrain() {
+  const views = railsNear(car.x - 2000, car.y - 2000, car.x + 2000, car.y + 2000);
+  if (!views.length) return;
+  const s = views[Math.floor(Math.random() * views.length)].seg;
+  const line = s.dir ? s.i : s.j;
+  if (trains.some(t => t.dir === s.dir && t.line === line)) return;
+  let best = 0, bd = Infinity;
+  for (let q = 0; q < s.n; q++) { const d = Math.hypot(s.xs[q] - car.x, s.ys[q] - car.y); if (d < bd) { bd = d; best = q; } }
+  const sign = Math.random() < 0.5 ? 1 : -1;
+  const t = { dir: s.dir, line, k: s.dir ? s.j : s.i, d: s.cum[best] - sign * (1800 + Math.random() * 800),
+              sign, speed: 230 + Math.random() * 110, cars: [], laid: [] };
+  railNorm(t);
+  t.cars.push({ type: 'loco', len: 42, col: Math.random() < .5 ? '#b8322a' : '#2f5f9e' });
+  for (let n = 8 + Math.floor(Math.random() * 11); n > 0; n--) {
+    const type = WAGON_TYPES[Math.floor(Math.random() * WAGON_TYPES.length)];
+    t.cars.push({ type, len: type === 'tank' ? 30 : 34, col: CONTAINER_COLS[Math.floor(Math.random() * CONTAINER_COLS.length)] });
+  }
+  layoutTrain(t);
+  trains.push(t);
+}
+function nearLevels() {
+  const out = new Set(), ccx = Math.floor(car.x / CS), ccy = Math.floor(car.y / CS);
+  for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+    const c = chunks.get(ckey(ccx + dx, ccy + dy));
+    if (c && c.done) for (const L of c.levels) out.add(L);
+  }
+  return out;
+}
+function updateTrains(dt) {
+  trainSpawn -= dt;
+  if (trainSpawn <= 0) { trainSpawn = 2; if (trains.length < 2) spawnTrain(); }
+  for (let i = trains.length - 1; i >= 0; i--) {
+    const t = trains[i];
+    t.d += t.sign * t.speed * dt; railNorm(t); layoutTrain(t);
+    const head = t.laid[0], tail = t.laid[t.laid.length - 1];
+    if (Math.hypot(head.x - car.x, head.y - car.y) > 5000 && Math.hypot(tail.x - car.x, tail.y - car.y) > 5000) trains.splice(i, 1);
+  }
+  // Bahnübergang schließt, solange ein Zug in der Nähe ist
+  for (const L of nearLevels()) {
+    let near = false;
+    for (const t of trains) { for (const w of t.laid) if (Math.hypot(w.x - L.x, w.y - L.y) < 420) { near = true; break; } if (near) break; }
+    L.active = near;
+    L.closed += ((near ? 1 : 0) - L.closed) * Math.min(1, dt * 2.2);
+  }
+}
+// Pfosten rechts vor dem Gleis je Fahrtrichtung; die Halbschranke sperrt die zuführende Spur
+function levelPosts(L) {
+  const s = L.seg, k = L.k, nx = s.nx[k], ny = s.ny[k], tx = ny, ty = -nx, h = s.half, dd = (RAIL_HALF + 10) / L.sin;
+  return [1, -1].map(sd => ({ x: L.x - tx * dd * sd + nx * (h + 5) * sd, y: L.y - ty * dd * sd + ny * (h + 5) * sd,
+                              ax: -nx * sd, ay: -ny * sd, len: h + 3 }));
+}
+function drawLevel(L) {
+  const blink = Math.floor(clock * 3) % 2;
+  for (const P of levelPosts(L)) {
+    if (L.barrier) {                                                 // rot-weiße Schranke, beim Öffnen kürzer (klappt hoch)
+      const len = P.len * (0.12 + 0.88 * L.closed), ex = P.x + P.ax * len, ey = P.y + P.ay * len;
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = 'rgba(0,0,0,0.25)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(P.x + 3, P.y + 4); ctx.lineTo(ex + 3, ey + 4); ctx.stroke();
+      ctx.strokeStyle = '#f2f2ee'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(P.x, P.y); ctx.lineTo(ex, ey); ctx.stroke();
+      ctx.strokeStyle = '#d0262a'; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(P.x, P.y); ctx.lineTo(ex, ey); ctx.stroke();
+      ctx.setLineDash([]); ctx.lineCap = 'butt';
+    }
+    ctx.fillStyle = 'rgba(0,0,0,0.3)'; circle(P.x + 3, P.y + 4, 3.5);
+    ctx.fillStyle = '#5c6066'; circle(P.x, P.y, 3);                  // Pfosten
+    ctx.strokeStyle = '#f2f2ee'; ctx.lineWidth = 1.6;                // Andreaskreuz
+    ctx.beginPath(); ctx.moveTo(P.x - 4, P.y - 4); ctx.lineTo(P.x + 4, P.y + 4); ctx.moveTo(P.x + 4, P.y - 4); ctx.lineTo(P.x - 4, P.y + 4); ctx.stroke();
+    ctx.strokeStyle = '#d0262a'; ctx.lineWidth = 0.7; ctx.stroke();
+    ctx.fillStyle = L.active && blink ? '#ff3b2a' : '#5a1a16'; circle(P.x + P.ay * 3, P.y - P.ax * 3, 1.8);  // Blinklicht
+    ctx.fillStyle = L.active && !blink ? '#ff3b2a' : '#5a1a16'; circle(P.x - P.ay * 3, P.y + P.ax * 3, 1.8);
+  }
+}
+function drawTrains() {
+  for (const t of trains) for (const w of t.laid) {
+    const hl = w.len / 2, hw = w.type === 'loco' ? 7 : 6.5;
+    ctx.save(); ctx.translate(w.x, w.y); ctx.rotate(w.a);
+    ctx.fillStyle = 'rgba(0,0,0,0.3)'; ctx.fillRect(-hl + 4, -hw + 5, w.len, hw * 2);
+    switch (w.type) {
+      case 'loco':
+        ctx.fillStyle = w.col; rrect(-hl, -hw, w.len, hw * 2, 3);
+        ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fillRect(-hl + 4, -4, w.len - 16, 8);           // Motorhaube
+        ctx.fillStyle = 'rgba(255,255,255,0.25)';
+        for (let x = -hl + 6; x < hl - 14; x += 4) ctx.fillRect(x, -3, 1.5, 6);                // Lüftungsgitter
+        ctx.fillStyle = '#1e2a36'; ctx.fillRect(hl - 10, -hw + 1.5, 6, hw * 2 - 3);             // Führerhaus
+        ctx.fillStyle = '#f2c230'; ctx.fillRect(hl - 2.5, -hw, 2.5, hw * 2);                    // Warnanstrich
+        ctx.fillStyle = '#fff6c8'; ctx.fillRect(hl - 1, -5, 1.5, 2); ctx.fillRect(hl - 1, 3, 1.5, 2);
+        break;
+      case 'container':
+        ctx.fillStyle = '#3b3b3b'; ctx.fillRect(-hl, -hw, w.len, hw * 2);
+        ctx.fillStyle = w.col; ctx.fillRect(-hl + 1.5, -hw + 0.5, w.len - 3, hw * 2 - 1);
+        ctx.fillStyle = 'rgba(0,0,0,0.18)';
+        for (let x = -hl + 4; x < hl - 2; x += 3) ctx.fillRect(x, -hw + 0.5, 1, hw * 2 - 1);    // Sicken
+        break;
+      case 'tank':
+        ctx.fillStyle = '#3b3b3b'; ctx.fillRect(-hl, -hw + 1, w.len, hw * 2 - 2);
+        ctx.fillStyle = '#2a2d31'; rrect(-hl + 1, -hw, w.len - 2, hw * 2, 6);
+        ctx.fillStyle = 'rgba(255,255,255,0.22)'; ctx.fillRect(-hl + 4, -hw + 2, w.len - 8, 2);
+        ctx.fillStyle = '#4a4e54'; circle(0, 0, 3);                                          // Dom
+        break;
+      case 'hopper':
+        ctx.fillStyle = '#4a4038'; ctx.fillRect(-hl, -hw, w.len, hw * 2);
+        ctx.fillStyle = '#16161a'; for (const x of [-hl / 2, 0, hl / 2]) circle(x, 0, 5.2);    // Kohle
+        ctx.fillStyle = 'rgba(255,255,255,0.12)'; for (const x of [-hl / 2, 0, hl / 2]) circle(x - 1.5, -1.5, 1.6);
+        break;
+      case 'logs':
+        ctx.fillStyle = '#3b3b3b'; ctx.fillRect(-hl, -hw, w.len, hw * 2);
+        for (const y of [-3.6, 0, 3.6]) {
+          ctx.fillStyle = '#7a5530'; ctx.fillRect(-hl + 2, y - 1.7, w.len - 4, 3.4);
+          ctx.fillStyle = '#c69a62'; circle(hl - 2, y, 1.7); circle(-hl + 2, y, 1.7);
+        }
+        ctx.fillStyle = '#1e1f22'; for (const x of [-hl + 6, 0, hl - 6]) { ctx.fillRect(x, -hw, 1.2, 1.5); ctx.fillRect(x, hw - 1.5, 1.2, 1.5); }
+        break;
+      case 'box':
+        ctx.fillStyle = '#7a3b2a'; ctx.fillRect(-hl, -hw, w.len, hw * 2);
+        ctx.fillStyle = 'rgba(0,0,0,0.2)'; for (let x = -hl + 3; x < hl; x += 4) ctx.fillRect(x, -hw, 1, hw * 2);
+        ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fillRect(-hl, -0.6, w.len, 1.2);
+        break;
+    }
+    ctx.restore();
+  }
+}
+
 // ---------- Kamera ----------
 const cam = { x: 0, y: 0, z: 1 };
 function baseZoom() { return clamp(Math.min(W, H) / 820, 0.55, 1.25); }
@@ -2686,13 +3121,31 @@ function render() {
       for (const o of c.dyn) if (o.x > x0 - 30 && o.x < x1 + 30 && o.y > y0 - 30 && o.y < y1 + 30) dyns.push(o);
     }
   }
+  const canopies = [];
+  for (let cy = Math.floor(by0 / CS); cy <= Math.floor(by1 / CS); cy++)
+    for (let cx = Math.floor(bx0 / CS); cx <= Math.floor(bx1 / CS); cx++) {
+      const c = chunks.get(ckey(cx, cy));
+      if (c && c.done && c.canopy) canopies.push(c.canopy);
+    }
+  ctx.fillStyle = 'rgba(0,0,0,0.24)';                               // Schatten der Waldränder
+  for (const cp of canopies) ctx.fill(cp.shadow);
   for (const o of lows) drawShadow(o);
   for (const o of dyns) drawShadow(o);
   for (const o of highs) drawShadow(o);
   for (const o of lows) drawStatic(o);
   for (const o of dyns) drawDyn(o);
+  drawTrains();
+  const railDecks = new Set(), levels = new Set();
+  for (let cy = Math.floor(by0 / CS); cy <= Math.floor(by1 / CS); cy++) {
+    for (let cx = Math.floor(bx0 / CS); cx <= Math.floor(bx1 / CS); cx++) {
+      const c = chunks.get(ckey(cx, cy));
+      if (c && c.done) { for (const z of c.railDecks) railDecks.add(z); for (const L of c.levels) levels.add(L); }
+    }
+  }
+  for (const z of railDecks) drawDeck(z);                           // Autobahnbrücken über die Bahn
   for (const r of rods) if (r.landed) drawRod(r);
   if (!car.upper) drawCar();
+  for (const L of levels) drawLevel(L);
   const decks = new Set();
   for (let cy = Math.floor(by0 / CS); cy <= Math.floor(by1 / CS); cy++) {
     for (let cx = Math.floor(bx0 / CS); cx <= Math.floor(bx1 / CS); cx++) {
@@ -2744,6 +3197,12 @@ function render() {
     ctx.beginPath(); ctx.moveTo(b.x - ux * 12, b.y - uy * 12); ctx.lineTo(b.x, b.y); ctx.stroke();
   }
   ctx.lineCap = 'butt';
+  for (const cp of canopies) for (const g of cp.groups.values()) {  // Waldrand-Kronen und Waldmantel
+    ctx.fillStyle = g.cols[0]; ctx.fill(g.base);
+    ctx.fillStyle = g.cols[1]; ctx.fill(g.mid);
+    ctx.fillStyle = g.cols[2]; ctx.fill(g.hi);
+    ctx.fillStyle = 'rgba(232,238,244,0.92)'; ctx.fill(g.snow);
+  }
   for (const o of highs) drawStatic(o);
 
   const lamps = [];
@@ -2777,6 +3236,15 @@ function beam(g, col, ox, oy, a, L, spread, peak, per) {
     g.beginPath(); g.moveTo(ox, oy); g.arc(ox, oy, len, a - sp, a + sp); g.closePath(); g.fill();
   }
 }
+function locoLights(g, col, additive) {
+  const per = additive ? 1 / BEAM_LAYERS : 1 - Math.pow(0.05, 1 / BEAM_LAYERS);
+  for (const t of trains) {
+    const L = t.laid[0];
+    if (!L) continue;
+    const fx = Math.cos(L.a), fy = Math.sin(L.a);
+    beam(g, col, L.x + fx * 21, L.y + fy * 21, L.a, 380, 0.32, 1, per);
+  }
+}
 function carLights(g, col, additive) {
   const per = additive ? 1 / BEAM_LAYERS : 1 - Math.pow(0.05, 1 / BEAM_LAYERS);
   const fx = Math.cos(car.a), fy = Math.sin(car.a), rx = -fy, ry = fx;
@@ -2799,6 +3267,8 @@ function specialLights() {
     out.push({ x: bx, y: by, r: 110, cut: 0.6, glow: 0.35, col: rgba(255, 190, 90) });
   }
   for (const r of rods.slice(-20)) out.push({ x: r.x, y: r.y, r: 55, cut: 0.45 * Math.min(1, r.life / 3), glow: 0.3 * Math.min(1, r.life / 3), col: rgba(110, 255, 70) });
+  if (Math.floor(clock * 3) % 2 === 0) for (const L of nearLevels()) if (L.active)
+    for (const P of levelPosts(L)) out.push({ x: P.x, y: P.y, r: 40, cut: 0.4, glow: 0.4, col: rgba(255, 40, 30) });
   if (id === 'kitt') {
     const sy = Math.sin(clock * 5) * 7.5;
     out.push({ x: car.x + fx * 21 - fy * sy, y: car.y + fy * 21 + fx * sy, r: 22, cut: 0.3, glow: 0.5, col: rgba(255, 30, 20) });
@@ -2824,6 +3294,7 @@ function drawNight(lamps) {
     g.beginPath(); g.arc(l.x, l.y, LAMP_R, 0, TAU); g.fill();
   }
   carLights(g, a => `rgba(0,0,0,${a.toFixed(4)})`, false);
+  locoLights(g, a => `rgba(0,0,0,${a.toFixed(4)})`, false);
   for (const L of specialLights()) {                                // Blaulicht, Taxischild, Scanner, Flammen
     radial(g, L.x, L.y, L.r, [[0, `rgba(0,0,0,${L.cut})`], [1, 'rgba(0,0,0,0)']]);
     g.beginPath(); g.arc(L.x, L.y, L.r, 0, TAU); g.fill();
@@ -2842,6 +3313,7 @@ function drawNight(lamps) {
     ctx.fillStyle = `rgba(255,236,190,${0.9 * k})`; circle(l.x, l.y, 2.2);
   }
   carLights(ctx, a => `rgba(255,244,214,${(a * 0.16 * k).toFixed(4)})`, true);
+  locoLights(ctx, a => `rgba(255,244,214,${(a * 0.16 * k).toFixed(4)})`, true);
   for (const L of specialLights()) {
     radial(ctx, L.x, L.y, L.r, [[0, L.col(L.glow * k)], [1, L.col(0)]]);
     ctx.beginPath(); ctx.arc(L.x, L.y, L.r, 0, TAU); ctx.fill();
@@ -2873,7 +3345,7 @@ mapShown.width = mapShown.height = MAP_N;
 let mapRow = 0, mapCX = 0, mapCY = 0, shownCX = 0, shownCY = 0, mapReady = false;
 
 let mapRoads = [];
-let mapPlaces = [], mapRivers = [];
+let mapPlaces = [], mapRivers = [], mapRails = [];
 const MAP_ROAD_STYLE = { street: [1.2, '#e3e1da'], track: [1, '#7d6444'], lane: [1.5, '#d6d6cf'], road: [2, '#f4f4ef'], hw: [3.5, '#f2c14e'] };
 
 function mapWork(rows) {
@@ -2882,12 +3354,13 @@ function mapWork(rows) {
     mapRoads = segsNear(car.x - MAP_R - 300, car.y - MAP_R - 300, car.x + MAP_R + 300, car.y + MAP_R + 300);
     mapPlaces = settlementsNear(car.x - MAP_R, car.y - MAP_R, car.x + MAP_R, car.y + MAP_R).filter(s => s.kind !== 'village');
     mapRivers = riversNear(car.x - MAP_R - 300, car.y - MAP_R - 300, car.x + MAP_R + 300, car.y + MAP_R + 300);
+    mapRails = railsNear(car.x - MAP_R - 300, car.y - MAP_R - 300, car.x + MAP_R + 300, car.y + MAP_R + 300);
   }
   const d = mapBuf.data;
   for (let n = 0; n < rows && mapRow < MAP_N; n++, mapRow++) {
     const wy = mapCY - MAP_R + (mapRow + .5) * MAP_CELL;
     for (let i = 0; i < MAP_N; i++) {
-      const p = SURF[surfaceAt(mapCX - MAP_R + (i + .5) * MAP_CELL, wy, NO_ROADS, undefined, NO_RIVERS)].rgb;
+      const p = SURF[surfaceAt(mapCX - MAP_R + (i + .5) * MAP_CELL, wy, NO_ROADS, undefined, NO_RIVERS, NO_RAILS)].rgb;
       const o = (mapRow * MAP_N + i) * 4;
       d[o] = p[0]; d[o + 1] = p[1]; d[o + 2] = p[2]; d[o + 3] = 255;
     }
@@ -2931,6 +3404,21 @@ function drawMap() {
       mctx.lineTo((r.xs[q2] - car.x) * k + S / 2, (r.ys[q2] - car.y) * k + S / 2);
       mctx.stroke();
     }
+  }
+  mctx.strokeStyle = '#3b3029'; mctx.lineWidth = 1.6; mctx.setLineDash([4, 3]);   // Gleise
+  for (const v of mapRails) {
+    const s = v.seg;
+    mctx.beginPath();
+    for (let q = v.i0; q <= v.i1; q += 3) {
+      const x = (s.xs[q] - car.x) * k + S / 2, y = (s.ys[q] - car.y) * k + S / 2;
+      q === v.i0 ? mctx.moveTo(x, y) : mctx.lineTo(x, y);
+    }
+    mctx.stroke();
+  }
+  mctx.setLineDash([]);
+  for (const t of trains) for (const w of t.laid) {                 // Züge
+    mctx.fillStyle = w.type === 'loco' ? '#ff5a3c' : '#e9e2d0';
+    mctx.fillRect((w.x - car.x) * k + S / 2 - 1.5, (w.y - car.y) * k + S / 2 - 1.5, 3, 3);
   }
   for (const s of mapPlaces) {
     const x = (s.x - car.x) * k + S / 2, y = (s.y - car.y) * k + S / 2;
@@ -3015,6 +3503,7 @@ function newWorld(seed) {
   setlCache.clear();
   rivCache.clear();
   rods.length = 0;
+  railCache.clear(); levelCache.clear(); trains.length = 0;
   allCrossings.length = 0;
   car.zone = null; car.upper = false;
   particles.length = 0;
@@ -3046,6 +3535,7 @@ function frame(now) {
   updateTurret(dt);
   updateBond(dt);
   updateRods(dt);
+  updateTrains(dt);
   nightLevel += ((night ? 1 : 0) - nightLevel) * Math.min(1, dt * 2.5);
 
   ensureChunks();
