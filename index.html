@@ -1939,6 +1939,27 @@ function updateRods(dt) {
                                       (Math.random() - .5) * 10, (Math.random() - .5) * 10, 'rgba(170,255,120,', 1.2, 0.6);
   }
 }
+// Brennstab trifft Tier oder Mensch (im späten Flug oder am Boden liegend): Zombie
+function rodInfections() {
+  for (const r of rods) {
+    if (!r.landed && r.t < ROD_FLIGHT * 0.6) continue;               // noch zu hoch in der Luft
+    const cx0 = Math.floor(r.x / CS), cy0 = Math.floor(r.y / CS);
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const c = chunks.get(ckey(cx0 + dx, cy0 + dy));
+      if (!c || !c.done) continue;
+      for (const o of c.dyn)
+        if ((o.animal || o.person) && !o.zombie && !o.dead && Math.hypot(o.x - r.x, o.y - r.y) < o.r + 7) zombify(o);
+    }
+  }
+}
+function zombify(o) {
+  o.zombie = true; o.down = 0; o.cross = 0; o.free = true; o.target = null; o.retarget = 0;
+  for (let k = 0; k < 10; k++) {
+    const a = Math.random() * TAU, s = 20 + Math.random() * 50;
+    emit(o.x, o.y, Math.cos(a) * s, Math.sin(a) * s, 'rgba(130,255,90,', 2 + Math.random() * 2, 0.6);
+  }
+}
+
 function drawRod(r) {
   const lift = r.landed ? 0 : Math.sin(Math.PI * r.t / ROD_FLIGHT), sc = 1 + 0.9 * lift;
   const fade = Math.min(1, r.life / 3), pulse = 0.7 + 0.3 * Math.sin(clock * 6 + r.x * 0.05);
@@ -2141,14 +2162,66 @@ function collide() {
   }
 }
 
+// ---------- Zombies ----------
+// Zombies schlurfen zum nächsten Lebenden in Reichweite und stecken ihn beim Biss an;
+// Lebende fliehen vor Zombies in ihrer Nähe.
+let zombies = [], living = [];
+const ZOMBIE_SPEED = { person: 30, sheep: 34, cow: 24 };
+function nearestOf(list, o, range) {
+  let best = null, bd = range;
+  for (const q of list) {
+    if (q === o || q.dead) continue;
+    const d = Math.hypot(q.x - o.x, q.y - o.y);
+    if (d < bd) { bd = d; best = q; }
+  }
+  return best;
+}
+function steer(o, tx, ty, dt, k) {
+  o.vx += (tx - o.vx) * Math.min(1, dt * k); o.vy += (ty - o.vy) * Math.min(1, dt * k);
+  const sp = Math.hypot(o.vx, o.vy);
+  if (sp > 4) { let da = Math.atan2(o.vy, o.vx) - o.a; da = Math.atan2(Math.sin(da), Math.cos(da)); o.a += da * Math.min(1, dt * 5); }
+  if (o.person) o.phase += sp * dt * 0.45;
+}
+function zombieAI(o, dt) {
+  o.retarget -= dt;
+  if (o.retarget <= 0 || !o.target || o.target.dead || o.target.zombie) { o.retarget = 0.5; o.target = nearestOf(living, o, 260); }
+  const sp = ZOMBIE_SPEED[o.t] || 30, wob = Math.sin(clock * 3 + o.x * 0.05) * 0.5;   // schlurfender Gang
+  if (o.target) {
+    const dx = o.target.x - o.x, dy = o.target.y - o.y, d = Math.hypot(dx, dy) || 1;
+    if (d < o.r + o.target.r + 2) { zombify(o.target); o.target = null; }               // Biss
+    else {
+      const lunge = d < 90 ? 2.3 : 1;                                 // auf den letzten Metern ein Satz nach vorn
+      const a = Math.atan2(dy, dx) + wob / lunge;
+      steer(o, Math.cos(a) * sp * lunge, Math.sin(a) * sp * lunge, dt, 3);
+    }
+  } else {
+    o.timer = (o.timer || 0) - dt;
+    if (o.timer <= 0) { o.timer = 1 + Math.random() * 3; o.wa = Math.random() * TAU; }
+    steer(o, Math.cos(o.wa + wob) * sp * 0.4, Math.sin(o.wa + wob) * sp * 0.4, dt, 2);
+  }
+}
+function fleeZombie(o, z, dt) {
+  const dx = o.x - z.x, dy = o.y - z.y, d = Math.hypot(dx, dy) || 1;
+  const sp = o.t === 'sheep' ? 46 : o.t === 'cow' ? 34 : 42;           // langsamer als ein angreifender Zombie
+  steer(o, dx / d * sp, dy / d * sp, dt, 4);
+}
+
 function updateDyn(dt) {
   const ccx = Math.floor(car.x / CS), ccy = Math.floor(car.y / CS);
+  zombies = []; living = [];
+  for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+    const c = chunks.get(ckey(ccx + dx, ccy + dy));
+    if (c && c.done) for (const o of c.dyn) if ((o.animal || o.person) && !o.dead) (o.zombie ? zombies : living).push(o);
+  }
   for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
     const c = chunks.get(ckey(ccx + dx, ccy + dy));
     if (!c || !c.done) continue;
     if (c.dyn.some(o => o.dead)) c.dyn = c.dyn.filter(o => !o.dead);
     for (const o of c.dyn) {
-      if (o.animal) animalAI(o, dt);
+      const z = (o.animal || o.person) && !o.zombie && !(o.down > 0) && zombies.length ? nearestOf(zombies, o, 80) : null;   // bemerken Zombies erst spät
+      if (o.zombie) zombieAI(o, dt);
+      else if (z) fleeZombie(o, z, dt);
+      else if (o.animal) animalAI(o, dt);
       else if (o.person) personAI(o, dt);
       else if (Math.abs(o.vx) + Math.abs(o.vy) + Math.abs(o.va) < 0.5) continue;
       o.x += o.vx * dt; o.y += o.vy * dt;
@@ -2185,21 +2258,25 @@ const revenge = () => CAR_TYPES[car.type].id === 'interceptor' && car.mode;
 function runOver(o, dirx, diry) {
   o.dead = true;
   const big = o.t === 'cow' ? 1.6 : o.t === 'person' ? 0.8 : 1;
+  // Zombies bluten grün; Farbton der Flecken, des Kerns und der Spritzer
+  const blood = o.zombie ? [[60, 150, 30], [30, 90, 14], [90, 200, 50]] : [[120, 10, 12], [90, 6, 8], [170, 16, 20]];
+  car.bloodRgb = blood[1];
   paintGround(o.x, o.y, 40 * big, g => {
     // verschmierter Fleck in Fahrtrichtung
     for (let i = 0; i < 9; i++) {
       const f = Math.random();
       const x = o.x + dirx * f * 26 * big + (Math.random() - .5) * 10 * big;
       const y = o.y + diry * f * 26 * big + (Math.random() - .5) * 10 * big;
-      g.fillStyle = `rgba(${120 + Math.random() * 40 | 0},10,12,${0.55 + Math.random() * 0.3})`;
+      const [br, bg, bb] = blood[0], v = 1 + Math.random() * 0.33;
+      g.fillStyle = `rgba(${br * v | 0},${bg * v | 0},${bb * v | 0},${0.55 + Math.random() * 0.3})`;
       g.beginPath(); g.ellipse(x, y, (5 + Math.random() * 6) * big, (3 + Math.random() * 4) * big, Math.atan2(diry, dirx), 0, TAU); g.fill();
     }
-    g.fillStyle = 'rgba(90,6,8,0.7)';
+    g.fillStyle = `rgba(${blood[1].join(',')},0.7)`;
     g.beginPath(); g.arc(o.x, o.y, 6 * big, 0, TAU); g.fill();
   });
   for (let k = 0; k < 18; k++) {
     const a = Math.atan2(diry, dirx) + (Math.random() - .5) * 2.2, s = 40 + Math.random() * 140;
-    emit(o.x, o.y, Math.cos(a) * s, Math.sin(a) * s, 'rgba(170,16,20,', 1.5 + Math.random() * 2, .5 + Math.random() * .3);
+    emit(o.x, o.y, Math.cos(a) * s, Math.sin(a) * s, `rgba(${blood[2].join(',')},`, 1.5 + Math.random() * 2, .5 + Math.random() * .3);
   }
   if (o.t === 'sheep') for (let k = 0; k < 10; k++) {
     const a = Math.random() * TAU, s = 20 + Math.random() * 60;
@@ -2207,7 +2284,7 @@ function runOver(o, dirx, diry) {
   }
   car.vx *= o.t === 'cow' ? 0.8 : 0.93; car.vy *= o.t === 'cow' ? 0.8 : 0.93;
   shake = Math.max(shake, o.t === 'cow' ? 5 : 2.5);
-  car.bloody = 2.5; // Sekunden mit roter Reifenspur
+  car.bloody = 2.5; // Sekunden mit blutiger Reifenspur
 }
 
 // Zeichnet etwas dauerhaft auf den Boden aller betroffenen Chunks (Weltkoordinaten)
@@ -2365,7 +2442,7 @@ function effects(dt) {
       else if (p.skid && (slipping || (car.braking && speed > 200 && i >= 2))) stamp(prev[0], prev[1], x, y, p.skid, 4);
     }
     if (car.bloody > 0 && prev && speed > 4 && Math.hypot(x - prev[0], y - prev[1]) < 60)
-      stamp(prev[0], prev[1], x, y, `rgba(120,12,14,${(0.45 * Math.min(1, car.bloody / 2.5)).toFixed(3)})`, 4);
+      stamp(prev[0], prev[1], x, y, `rgba(${(car.bloodRgb || [120, 12, 14]).join(',')},${(0.45 * Math.min(1, car.bloody / 2.5)).toFixed(3)})`, 4);
     car.prevW[i] = car.air > 0 ? null : [x, y];
     if (car.air > 0) continue;
 
@@ -2771,6 +2848,13 @@ function drawDyn(o) {
         ctx.fillStyle = o.hair; circle(6.5, 0, 2.6);
         break;
       }
+      if (o.zombie) {                                     // Zombie: grün, Arme nach vorn, rote Augen
+        ctx.fillStyle = '#8fbf6a'; circle(4.6, -3, 1.4); circle(4.6, 3, 1.4);
+        ctx.fillStyle = '#55623f'; ctx.beginPath(); ctx.ellipse(0, 0, 2.8, 4.6, 0, 0, TAU); ctx.fill();
+        ctx.fillStyle = '#7fa65a'; circle(0.4, 0, 2.6);
+        ctx.fillStyle = '#ff2a1a'; circle(2.2, -0.9, 0.55); circle(2.2, 0.9, 0.55);
+        break;
+      }
       const sw = Math.sin(o.phase) * 2.2;
       ctx.fillStyle = '#e2b897';                          // Arme
       circle(sw, -4.2, 1.4); circle(-sw, 4.2, 1.4);
@@ -2783,6 +2867,11 @@ function drawDyn(o) {
       ctx.strokeStyle = '#b39443'; ctx.lineWidth = 1.2;
       for (const r of [.3, .55, .8]) { ctx.beginPath(); ctx.arc(0, 0, o.r * r, 0, TAU); ctx.stroke(); }
       break;
+  }
+  if (o.zombie && o.animal) {                         // Zombie-Tier: grüner Schimmer, rote Augen
+    const L = o.t === 'cow' ? 11 : 7, hx = o.t === 'cow' ? 11 : 7;
+    ctx.fillStyle = 'rgba(110,210,80,0.5)'; ctx.beginPath(); ctx.ellipse(0, 0, L, o.t === 'cow' ? 6.5 : 6, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#ff2a1a'; circle(hx + 1, -1.2, 0.7); circle(hx + 1, 1.2, 0.7);
   }
   ctx.restore();
 }
@@ -3312,6 +3401,7 @@ function specialLights() {
   for (const r of rods.slice(-20)) out.push({ x: r.x, y: r.y, r: 55, cut: 0.45 * Math.min(1, r.life / 3), glow: 0.3 * Math.min(1, r.life / 3), col: rgba(110, 255, 70) });
   if (Math.floor(clock * 3) % 2 === 0) for (const L of nearLevels()) if (L.active)
     for (const P of levelPosts(L)) out.push({ x: P.x, y: P.y, r: 40, cut: 0.4, glow: 0.4, col: rgba(255, 40, 30) });
+  for (const z of zombies.slice(0, 15)) out.push({ x: z.x, y: z.y, r: 24, cut: 0.3, glow: 0.25, col: rgba(110, 255, 70) });
   if (id === 'kitt') {
     const sy = Math.sin(clock * 5) * 7.5;
     out.push({ x: car.x + fx * 21 - fy * sy, y: car.y + fy * 21 + fx * sy, r: 22, cut: 0.3, glow: 0.5, col: rgba(255, 30, 20) });
@@ -3578,6 +3668,7 @@ function frame(now) {
   updateTurret(dt);
   updateBond(dt);
   updateRods(dt);
+  rodInfections();
   updateTrains(dt);
   nightLevel += ((night ? 1 : 0) - nightLevel) * Math.min(1, dt * 2.5);
 
