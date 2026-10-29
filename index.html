@@ -105,7 +105,8 @@ function mulberry32(a) {
 
 // ---------- Untergründe ----------
 const S_DEEP = 0, S_SHALLOW = 1, S_ASPHALT = 2, S_GRAVEL = 3, S_GRASS = 4, S_SAND = 5,
-      S_MUD = 6, S_SNOW = 7, S_ICE = 8, S_BRIDGE = 9, S_DENSE = 10, S_ROCK = 11, S_CLIFF = 12, S_HEATH = 13;
+      S_MUD = 6, S_SNOW = 7, S_ICE = 8, S_BRIDGE = 9, S_DENSE = 10, S_ROCK = 11, S_CLIFF = 12,
+      S_PASTURE = 13, S_WHEAT = 14, S_CORN = 15, S_PLOW = 16;
 // grip: Seitenhaftung, accel/top: Anteil an Motorleistung/Höchstgeschwindigkeit, drag: Rollwiderstand, brake: Bremswirkung
 const SURF = [
   { name: 'Tiefes Wasser',  rgb: [34, 86, 140],   grip: 3,   accel: .4,  top: .4,  drag: 1.6, brake: .6, solid: true },
@@ -121,10 +122,13 @@ const SURF = [
   { name: 'Dichter Wald',   rgb: [36, 80, 40],    grip: 5,   accel: .75, top: .72, drag: .55, brake: .7, solid: true },
   { name: 'Fels',           rgb: [158, 146, 124], grip: 4.6, accel: .7,  top: .68, drag: .5,  brake: .8, dust: 'rgba(170,165,155,', dustSlipOnly: true },
   { name: 'Felswand',       rgb: [88, 88, 94],   grip: 4.6, accel: .7,  top: .68, drag: .5,  brake: .8, solid: true },
-  { name: 'Heide',          rgb: [148, 138, 86],  grip: 4.6, accel: .72, top: .7,  drag: .6,  brake: .7, track: 'rgba(90,80,45,0.18)', dust: 'rgba(150,135,90,', dustSlipOnly: true },
+  { name: 'Weide',          rgb: [104, 160, 70],  grip: 5,   accel: .75, top: .72, drag: .55, brake: .7, track: 'rgba(48,88,34,0.18)', dust: 'rgba(80,130,55,', dustSlipOnly: true },
+  { name: 'Weizenfeld',     rgb: [214, 180, 92],  grip: 4,   accel: .6,  top: .6,  drag: 1,   brake: .75, track: 'rgba(150,118,50,0.35)', dust: 'rgba(232,204,128,' },
+  { name: 'Maisfeld',       rgb: [86, 128, 48],   grip: 3.6, accel: .5,  top: .45, drag: 1.6, brake: .8, track: 'rgba(52,72,26,0.42)', dust: 'rgba(120,160,64,' },
+  { name: 'Acker',          rgb: [122, 92, 62],   grip: 3.2, accel: .55, top: .55, drag: 1.1, brake: .7, track: 'rgba(70,50,30,0.35)', dust: 'rgba(146,114,82,' },
 ];
 
-let lastE = 0, lastM = 0, lastH = 0, lastCold = false;
+let lastE = 0, lastM = 0, lastH = 0, lastCold = false, lastPW = 0;
 
 const WL = 0.395, WD = 0.37;   // Wasserspiegel, Grenze zum tiefen Wasser
 const DENSE_F = 0.68;          // ab hier ist der Wald undurchdringlich
@@ -181,11 +185,12 @@ const NETS = [
 ];
 // Fahrstreifen sind 36 px breit, das Auto inkl. Räder 28 px.
 const LANE = 36;
+const TRACK_VERGE = 18; // freier Randstreifen neben Waldwegen
 const RT = {
   hw:    { half: 83, sh: 8, col: '#4b4d53', name: 'Autobahn', rank: 3 },    // 7.5 Mitte + 2 Streifen + 3.5 Rand
   road:  { half: 40, sh: 6, col: '#5a5b61', name: 'Landstraße', rank: 2 },  // 1 Streifen je Richtung + 4 Rand
   lane:  { half: 30, sh: 4, col: '#5a5b61', name: 'Nebenstraße', rank: 2 },
-  track: { half: 14, sh: 0, col: '#a08f70', name: 'Waldweg', rank: 1 },
+  track: { half: 20, sh: 0, col: '#a08f70', name: 'Waldweg', rank: 1 },
 };
 const segCache = new Map();
 const NO_ROADS = [];
@@ -199,7 +204,7 @@ function edgeExists(net, i, j, dir) {
   if (net === 0) return dir ? hash(i, 0, SEED + 301) < 0.4 : hash(0, j, SEED + 300) < 0.4;
   return hash(i, j, SEED + 310 + net * 2 + dir) < (net === 1 ? 0.68 : 0.6);
 }
-const WOODLAND = { [S_GRASS]: 1, [S_SNOW]: 1, [S_MUD]: 1, [S_DENSE]: 1, [S_HEATH]: 1 };
+const WOODLAND = { [S_GRASS]: 1, [S_SNOW]: 1, [S_MUD]: 1, [S_DENSE]: 1 };
 function nodeDegree(net, i, j) {
   return edgeExists(net, i, j, 0) + edgeExists(net, i - 1, j, 0) + edgeExists(net, i, j, 1) + edgeExists(net, i, j - 1, 1);
 }
@@ -225,11 +230,13 @@ function buildSeg(net, i, j, dir, key) {
   const xs = new Float32Array(n), ys = new Float32Array(n), nx = new Float32Array(n), ny = new Float32Array(n);
   const water = new Uint8Array(n);
   let forest = 0, wet = 0, mt = 0;
+  const hs = new Float32Array(n);
   for (let q = 0; q < n; q++) {
     const t = q / (n - 1), u = 1 - t, b0 = u * u * u, b1 = 3 * u * u * t, b2 = 3 * u * t * t, b3 = t * t * t;
     xs[q] = b0 * A[0] + b1 * P1[0] + b2 * P2[0] + b3 * B[0];
     ys[q] = b0 * A[1] + b1 * P1[1] + b2 * P2[1] + b3 * B[1];
-    if (mtnH(xs[q], ys[q]) > 0.3) mt++;
+    hs[q] = mtnH(xs[q], ys[q]);
+    if (hs[q] > 0.3) mt++;
   }
   const mtn = net !== 2 && mt > n * 0.1;
   // Gebirgsstraßen schlängeln sich in Serpentinen; an den Knoten (t=0/1) bleibt die Lage unverändert
@@ -265,9 +272,35 @@ function buildSeg(net, i, j, dir, key) {
   const marked = hash(dir ? i : j, dir, SEED + 330) < 0.6;
   const type = net === 0 ? 'hw' : net === 1 ? (!deadEnd && marked ? 'road' : 'lane') : 'track';
   const rt = RT[type];
-  return { key, net, i, j, dir, type, rank: rt.rank, half: rt.half, sh: rt.sh, col: rt.col, xs, ys, nx, ny, water, n,
+  const tun = net === 0 && mtn ? findTunnels(hs, n) : null;
+  return { key, net, i, j, dir, type, tunnel: tun && tun.flags, tunnels: tun ? tun.runs : [], rank: rt.rank, half: rt.half, sh: rt.sh, col: rt.col, xs, ys, nx, ny, water, n,
            step: plen / (n - 1), mtn,
            hasWater: wet > 0, minx, miny, maxx, maxy };
+}
+
+// Autobahnabschnitte durch Felswand werden zu Tunneln: kleine Lücken schließen,
+// zu kurze Stücke bleiben offene Felseinschnitte, Portale stehen etwas vor der Felswand.
+function findTunnels(hs, n) {
+  const runs = [];
+  let st = -1;
+  for (let q = 0; q <= n; q++) {
+    const on = q < n && hs[q] > 0.55;
+    if (on && st < 0) st = q;
+    if (!on && st >= 0) {
+      if (runs.length && st - runs[runs.length - 1][1] < 5) runs[runs.length - 1][1] = q - 1;
+      else runs.push([st, q - 1]);
+      st = -1;
+    }
+  }
+  const flags = new Uint8Array(n), out = [];
+  for (let [a, b] of runs) {
+    const atEnd = a === 0 || b === n - 1; // läuft im Nachbarsegment weiter
+    if (b - a < 6 && !atEnd) continue;
+    a = Math.max(0, a - 2); b = Math.min(n - 1, b + 2);
+    flags.fill(1, a, b + 1);
+    out.push([a, b]);
+  }
+  return out.length ? { flags, runs: out } : null;
 }
 
 // Alle Segmente nahe eines Rechtecks, jeweils auf den relevanten Stützpunktbereich beschnitten
@@ -334,7 +367,9 @@ const allCrossings = [];
 function makeCrossing(a, b, i, j, x, y) {
   const sin = Math.max(0.4, Math.abs(a.ny[i] * -b.nx[j] - -a.nx[i] * b.ny[j]));
   // a ist immer die Autobahn; Waldwege liegen nie auf einer Brücke
-  const aUp = b.type === 'track' || hash(Math.floor(x / 64), Math.floor(y / 64), SEED + 700) < 0.5;
+  // im Tunnel liegt die Autobahn immer unten
+  const aUp = !(a.tunnel && a.tunnel[i]) &&
+              (b.type === 'track' || hash(Math.floor(x / 64), Math.floor(y / 64), SEED + 700) < 0.5);
   const up = aUp ? a : b, lo = aUp ? b : a;
   const span = (lo.half + lo.sh + UNDERPASS_CLEAR) / sin + 24;     // halbe Brückenlänge
   const R = Math.max(span + 80, (up.half + up.sh + 30) / sin);
@@ -370,11 +405,11 @@ function segNearest(views, x, y) {
 }
 
 // Vorzeichenbehafteter Abstand zum Fahrbahnrand (negativ = auf der Fahrbahn)
-const RQ = { edge: 1e9, seg: null };
+const RQ = { edge: 1e9, seg: null, k: 0 };
 function roadQuery(x, y, views) {
-  let best = 1e9, bs = null;
+  let best = 1e9, bs = null, bk = 0;
   for (const v of views) {
-    const s = v.seg, m = s.half + s.sh + 16;
+    const s = v.seg, m = s.half + s.sh + 32; // deckt auch den Randstreifen der Waldwege ab
     if (x < s.minx - m || x > s.maxx + m || y < s.miny - m || y > s.maxy + m) continue;
     const xs = s.xs, ys = s.ys;
     for (let k = v.i0; k < v.i1; k++) {
@@ -383,10 +418,10 @@ function roadQuery(x, y, views) {
       const bx = xs[k + 1] - ax, by = ys[k + 1] - ay, px = x - ax, py = y - ay;
       const t = clamp((px * bx + py * by) / (bx * bx + by * by), 0, 1);
       const d = Math.hypot(px - bx * t, py - by * t) - s.half;
-      if (d < best) { best = d; bs = s; }
+      if (d < best) { best = d; bs = s; bk = t < 0.5 ? k : k + 1; }
     }
   }
-  RQ.edge = best; RQ.seg = bs;
+  RQ.edge = best; RQ.seg = bs; RQ.k = bk;
   return RQ;
 }
 
@@ -396,9 +431,11 @@ function surfaceAt(x, y, views) {
   const cold = t < 0.39, water = e < WL && h < 0.2;
   const R = roadQuery(x, y, views || segsNear(x, y, x, y));
   lastE = e; lastH = h; lastCold = cold;
+  let verge = false;
   if (R.seg) {
     if (R.edge < 0) return R.seg.type === 'track' ? S_GRAVEL : (water ? S_BRIDGE : S_ASPHALT);
     if (R.edge < R.seg.sh && !water) return S_GRAVEL;
+    verge = R.seg.type === 'track' && R.edge < TRACK_VERGE;
   }
   if (water) return cold ? S_ICE : (e < WD ? S_DEEP : S_SHALLOW);
   if (h > 0.6) return S_CLIFF;
@@ -407,13 +444,35 @@ function surfaceAt(x, y, views) {
   const m = fbm(x / 800, y / 800, SEED + 47, 3);
   const f = forestAt(x, y);
   lastM = m;
-  if (cold) return f > DENSE_F ? S_DENSE : m > 0.68 ? S_ICE : S_SNOW;
+  // am Waldweg weicht der dichte Wald einem befahrbaren Randstreifen
+  if (cold) return f > DENSE_F && !verge ? S_DENSE : m > 0.68 ? S_ICE : S_SNOW;
   if (t > 0.62) return m > 0.66 ? S_GRASS : S_SAND;
+  if (m < 0.68 && f < 0.56 && farmAt(x, y)) {
+    const P = parcelAt(x, y);
+    lastPW = P.w;
+    return P.border ? S_GRASS : P.kind;
+  }
   if (m > 0.7) return vnoise(x / 70, y / 70, SEED + 9) > 0.55 ? S_SHALLOW : S_MUD; // Sumpf
   if (m > 0.63) return S_MUD;
-  if (f > DENSE_F) return S_DENSE;
-  if (m < 0.38) return S_HEATH;
+  if (f > DENSE_F) return verge ? S_GRASS : S_DENSE;
   return S_GRASS;
+}
+
+// ---------- Agrarland ----------
+// Rechteckige Parzellen in einheitlicher Ausrichtung je Welt, getrennt durch Grünstreifen
+const PARCEL = { kind: 0, w: 0, border: false, animal: '' };
+const PARCEL_U = 300, PARCEL_W = 210, PARCEL_EDGE = 10;
+function farmAt(x, y) { return fbm(x / 1400, y / 1400, SEED + 120, 2) > 0.45; }
+function parcelAt(x, y) {
+  const a = hash(1, 2, SEED + 123) * Math.PI, c = Math.cos(a), s = Math.sin(a);
+  const u = x * c + y * s, w = -x * s + y * c;
+  const pi = Math.floor(u / PARCEL_U), pj = Math.floor(w / PARCEL_W);
+  PARCEL.border = u - pi * PARCEL_U < PARCEL_EDGE || w - pj * PARCEL_W < PARCEL_EDGE;
+  const h = hash(pi, pj, SEED + 122);
+  PARCEL.kind = h < 0.3 ? S_WHEAT : h < 0.5 ? S_CORN : h < 0.62 ? S_PLOW : S_PASTURE;
+  PARCEL.animal = h > 0.84 ? 'cow' : 'sheep';
+  PARCEL.w = w;
+  return PARCEL;
 }
 
 // ---------- Chunks ----------
@@ -430,6 +489,7 @@ function newChunk(cx, cy) {
   const p = SURF[s].rgb;
   return {
     cx, cy, segs, done: false, row: 0, lastUsed: frameNo,
+    roofImg: segs.some(v => v.seg.tunnels.length) ? new ImageData(CN, CN) : null, roof: null,
     surf: new Uint8Array(CN * CN), img: new ImageData(CN, CN),
     canvas: null, statics: [], dyn: [],
     fallback: `rgb(${p[0]},${p[1]},${p[2]})`,
@@ -445,50 +505,87 @@ function genRows(c, n) {
       const s = surfaceAt(wx, wy, c.segs);
       const idx = j * CN + i;
       c.surf[idx] = s;
-      const p = SURF[s].rgb;
-      let r = p[0], g = p[1], b = p[2];
-      const n1 = hash(c.cx * CN + i, c.cy * CN + j, SEED + 99);
-      const lf = vnoise(wx / 90, wy / 90, SEED + 5);
-      let v = 0.94 + 0.08 * n1 + 0.2 * (lf - .5);
-      if (s === S_DEEP) {
-        const k = clamp((lastE - (WD - 0.13)) / 0.13, 0, 1);
-        r = 24 + 22 * k; g = 62 + 36 * k; b = 112 + 38 * k; v = 0.97 + 0.05 * n1;
-      } else if (s === S_SHALLOW) {
-        const k = clamp((lastE - WD) / (WL - WD), 0, 1);
-        r = 58 + 40 * k; g = 128 + 42 * k; b = 182 + 18 * k; v = 0.97 + 0.05 * n1;
-      } else if (s === S_GRASS) {
-        const k = 0.5 - lastM; // trockener = gelblicher
-        r += k * 130; g += k * 30; b -= k * 20;
-      } else if (s === S_ICE) {
-        v = 0.95 + 0.1 * n1 + 0.12 * (lf - .5);
-      } else if (s === S_DENSE) {
-        const cr = crownAt(wx, wy);
-        v = 0.45 + 0.75 * Math.sqrt(cr.shade);
-        if (lastCold) {
-          r = 34; g = 72; b = 60;
-          if (cr.shade > 0.55 && cr.id > 0.4) { r = 214; g = 222; b = 230; } // Schnee auf den Kronen
-        } else if (autumnAt(wx, wy)) {
-          const pal = [[176, 84, 34], [196, 140, 40], [150, 52, 36], [96, 112, 46]];
-          [r, g, b] = pal[Math.floor(cr.id * pal.length)];
-        } else {
-          g = 76 + 30 * cr.id; r = 30 + 18 * cr.id;
-        }
-      } else if (s === S_HEATH) {
-        if (n1 > 0.84) { r = 146; g = 96; b = 150; } // Heidekraut
-      } else if (s === S_CLIFF && lastH > 0.8) {
-        r = 232; g = 236; b = 242;                   // Schneegipfel
+      shadeCell(c, s, wx, wy, i, j, d, idx * 4);
+      // Tunneldach: dasselbe Gelände, aber ohne Straße
+      if (c.roofImg) {
+        const rd = c.roofImg.data, o = idx * 4;
+        if (s === S_ASPHALT || s === S_GRAVEL) shadeCell(c, surfaceAt(wx, wy, NO_ROADS), wx, wy, i, j, rd, o);
+        else { rd[o] = d[o]; rd[o + 1] = d[o + 1]; rd[o + 2] = d[o + 2]; rd[o + 3] = 255; }
       }
-      if (lastH > 0.12 && s !== S_SHALLOW && s !== S_DEEP) {
-        const hh = lastH; // Hangschattierung, Licht von oben links
-        v *= 1 + clamp((mtnH(wx - 5, wy - 5) - mtnH(wx + 5, wy + 5)) * (s === S_CLIFF ? 11 : 7), -0.5, 0.5);
-        lastH = hh;
-      }
-      const o = idx * 4;
-      d[o] = clamp(r * v, 0, 255); d[o + 1] = clamp(g * v, 0, 255); d[o + 2] = clamp(b * v, 0, 255); d[o + 3] = 255;
     }
   }
   c.row = end;
   if (c.row >= CN) finalizeChunk(c);
+}
+
+// Farbe einer Rasterzelle; nutzt lastE/lastM/lastH/lastCold aus dem vorangegangenen surfaceAt
+function shadeCell(c, s, wx, wy, i, j, d, o) {
+  const p = SURF[s].rgb;
+  let r = p[0], g = p[1], b = p[2];
+  const n1 = hash(c.cx * CN + i, c.cy * CN + j, SEED + 99);
+  const lf = vnoise(wx / 90, wy / 90, SEED + 5);
+  let v = 0.94 + 0.08 * n1 + 0.2 * (lf - .5);
+  if (s === S_DEEP) {
+    const k = clamp((lastE - (WD - 0.13)) / 0.13, 0, 1);
+    r = 24 + 22 * k; g = 62 + 36 * k; b = 112 + 38 * k; v = 0.97 + 0.05 * n1;
+  } else if (s === S_SHALLOW) {
+    const k = clamp((lastE - WD) / (WL - WD), 0, 1);
+    r = 58 + 40 * k; g = 128 + 42 * k; b = 182 + 18 * k; v = 0.97 + 0.05 * n1;
+  } else if (s === S_GRASS) {
+    const k = 0.5 - lastM; // trockener = gelblicher
+    r += k * 130; g += k * 30; b -= k * 20;
+  } else if (s === S_ICE) {
+    v = 0.95 + 0.1 * n1 + 0.12 * (lf - .5);
+  } else if (s === S_DENSE) {
+    const cr = crownAt(wx, wy);
+    v = 0.45 + 0.75 * Math.sqrt(cr.shade);
+    if (lastCold) {
+      r = 34; g = 72; b = 60;
+      if (cr.shade > 0.55 && cr.id > 0.4) { r = 214; g = 222; b = 230; } // Schnee auf den Kronen
+    } else if (autumnAt(wx, wy)) {
+      const pal = [[176, 84, 34], [196, 140, 40], [150, 52, 36], [96, 112, 46]];
+      [r, g, b] = pal[Math.floor(cr.id * pal.length)];
+    } else {
+      g = 76 + 30 * cr.id; r = 30 + 18 * cr.id;
+    }
+  } else if (s === S_WHEAT) {                     // Saatreihen quer zur Parzelle
+    v *= (Math.floor(lastPW / 12) & 1 ? 0.93 : 1.04) + 0.08 * (n1 - .5);
+  } else if (s === S_CORN) {
+    const q = ((lastPW % 16) + 16) % 16;
+    v *= q < 8 ? 0.74 + 0.16 * n1 : 1.04 + 0.08 * n1;
+  } else if (s === S_PLOW) {                      // Furchen
+    v *= Math.floor(lastPW / 12) & 1 ? 0.86 : 1.04;
+  } else if (s === S_CLIFF && lastH > 0.8) {
+    r = 232; g = 236; b = 242;                   // Schneegipfel
+  }
+  if (lastH > 0.12 && s !== S_SHALLOW && s !== S_DEEP) {
+    const hh = lastH; // Hangschattierung, Licht von oben links
+    v *= 1 + clamp((mtnH(wx - 5, wy - 5) - mtnH(wx + 5, wy + 5)) * (s === S_CLIFF ? 11 : 7), -0.5, 0.5);
+    lastH = hh;
+  }
+  d[o] = clamp(r * v, 0, 255); d[o + 1] = clamp(g * v, 0, 255); d[o + 2] = clamp(b * v, 0, 255); d[o + 3] = 255;
+}
+
+// Felsdach über Tunneln: Tunnelverlauf als Maske, gefüllt mit dem Gelände ohne Straße
+const TUNNEL_EXTRA = 16;
+function buildRoof(c) {
+  const small = document.createElement('canvas');
+  small.width = small.height = CN;
+  small.getContext('2d').putImageData(c.roofImg, 0, 0);
+  const rc = document.createElement('canvas');
+  rc.width = rc.height = CS;
+  const g = rc.getContext('2d');
+  g.translate(-c.cx * CS, -c.cy * CS);
+  g.lineJoin = 'round'; g.lineCap = 'butt';
+  for (const v of c.segs) {
+    const s = v.seg;
+    if (s.tunnels.length) polyLine(g, s, 0, (s.half + s.sh + TUNNEL_EXTRA) * 2, '#000', null, k => s.tunnel[k]);
+  }
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalCompositeOperation = 'source-in';
+  g.imageSmoothingEnabled = false;
+  g.drawImage(small, 0, 0, CS, CS);
+  c.roof = rc;
 }
 
 function finalizeChunk(c) {
@@ -503,6 +600,7 @@ function finalizeChunk(c) {
   c.ctx = g;
   c.img = null;
   drawRoads(c);
+  if (c.roofImg) { buildRoof(c); c.roofImg = null; }
   c.crossings = [];
   const segs = c.segs.map(v => v.seg);
   for (const a of segs) if (a.net === 0) for (const b of segs) if (b.net !== 0) {
@@ -582,9 +680,9 @@ function drawMarkings(g, s, p) {
     polyLine(g, s, -(LANE + 1), 1.8, MARK, null, p);
     polyLine(g, s, LANE + 1, 1.8, MARK, null, p);
   } else if (s.type === 'track') {
-    polyLine(g, s, 0, 3, 'rgba(96,128,62,0.55)', null, p);            // Grasnarbe in der Mitte
-    polyLine(g, s, -7, 4, 'rgba(110,90,60,0.5)', null, p);            // Fahrspuren
-    polyLine(g, s, 7, 4, 'rgba(110,90,60,0.5)', null, p);
+    polyLine(g, s, 0, 5, 'rgba(96,128,62,0.55)', null, p);            // Grasnarbe in der Mitte
+    polyLine(g, s, -11, 5, 'rgba(110,90,60,0.5)', null, p);           // Fahrspuren
+    polyLine(g, s, 11, 5, 'rgba(110,90,60,0.5)', null, p);
   }
   if (s.mtn) {                                                        // Leitplanken im Gebirge
     for (const sg of [-1, 1]) {
@@ -642,7 +740,8 @@ function genObstacles(c) {
     if (Math.hypot(x - spawn.x, y - spawn.y) < 200) return false;
     if (!onRoad) {
       const R = roadQuery(x, y, c.segs);
-      if (R.seg && R.edge - R.seg.sh < r + 3) return false;
+      const clear = R.seg && R.seg.type === 'track' ? TRACK_VERGE : R.seg ? R.seg.sh : 0;
+      if (R.seg && R.edge - clear < r * 0.7 + 3) return false;
     }
     for (const o of S) if (Math.hypot(o.x - x, o.y - y) < o.r + r + 8) return false;
     for (const o of D) if (Math.hypot(o.x - x, o.y - y) < o.r + r + 4) return false;
@@ -651,7 +750,10 @@ function genObstacles(c) {
   const addDyn = (t, x, y, onRoad) => {
     const def = DYN[t];
     if (c.crossings.some(z => Math.hypot(x - z.x, y - z.y) < z.R)) return;
-    if (free(x, y, def.r, onRoad)) D.push({ t, x, y, r: def.r, m: def.m, vx: 0, vy: 0, a: rng() * TAU, va: 0, c: def.colors[Math.floor(rng() * def.colors.length)] });
+    if (!free(x, y, def.r, onRoad)) return;
+    const o = { t, x, y, r: def.r, m: def.m, vx: 0, vy: 0, a: rng() * TAU, va: 0, c: def.colors[Math.floor(rng() * def.colors.length)] };
+    if (def.animal) Object.assign(o, { animal: true, timer: rng() * 3, walk: 0, spots: [rng(), rng(), rng()] });
+    D.push(o);
   };
 
   for (let k = 0; k < 70; k++) {
@@ -660,7 +762,9 @@ function genObstacles(c) {
     const r = rng();
     const forest = forestAt(x, y);
     let o = null;
-    if (s === S_GRASS) {
+    if (s === S_GRASS && farmAt(x, y) && forest < 0.56) {
+      if (r < 0.22) o = { t: 'bush', x, y, r: 6 + rng() * 3 }; // Hecken zwischen den Parzellen
+    } else if (s === S_GRASS) {
       const pt = forest > 0.56 ? 0.75 : 0.07;
       if (r < pt) o = makeTree(rng, x, y);
       else if (r < pt + 0.06) o = { t: 'bush', x, y, r: 6 + rng() * 4 };
@@ -681,10 +785,13 @@ function genObstacles(c) {
     } else if (s === S_ROCK) {
       if (r < 0.14) o = makeRock(rng, x, y, 1.6);
       else if (r < 0.2) o = { ...makeTree(rng, x, y), t: 'pine', snow: fbm(x / 2400, y / 2400, SEED + 31, 3) < 0.45 };
-    } else if (s === S_HEATH) {
-      if (r < 0.1) o = { t: 'bush', x, y, r: 5 + rng() * 4, heath: true };
-      else if (r < 0.14) o = makeRock(rng, x, y);
-      else if (r < 0.17) o = makeTree(rng, x, y);
+    } else if (s === S_PASTURE) {
+      if (r < 0.16) {                                   // kleine Herde
+        const kind = parcelAt(x, y).animal, n = 3 + Math.floor(rng() * 4);
+        for (let q = 0; q < n; q++) addDyn(kind, x + (rng() - .5) * 60, y + (rng() - .5) * 60);
+        continue;
+      }
+      if (r < 0.08) o = makeTree(rng, x, y);
     } else if (s === S_ICE) {
       if (r < 0.04) o = makeRock(rng, x, y);
     } else if (s === S_SHALLOW) {
@@ -738,6 +845,8 @@ const DYN = {
   barrel: { r: 8,  m: 0.3,  colors: ['#c8352b', '#2f6db5', '#3d8a4a'] },
   crate:  { r: 9,  m: 0.35, colors: ['#a8783f'] },
   bale:   { r: 10, m: 0.4,  colors: ['#d9b85a'] },
+  sheep:  { r: 7,  m: 0.15, colors: ['#f1eee6', '#e6e1d4', '#3a3633'], animal: true },
+  cow:    { r: 11, m: 0.7,  colors: ['#f4f2ee', '#8a5a3a', '#2e2a28'], animal: true },
 };
 
 function chunkAt(x, y) {
@@ -826,6 +935,8 @@ function gatherNearby() {
     for (const o of c.dyn) if (Math.abs(o.x - car.x) < 120 && Math.abs(o.y - car.y) < 120) nearDyn.push(o);
   }
   updateZone();
+  const R = roadQuery(car.x, car.y, segsNear(car.x, car.y, car.x, car.y));
+  car.inTunnel = !car.upper && !!R.seg && !!R.seg.tunnel && R.edge < R.seg.sh + TUNNEL_EXTRA && !!R.seg.tunnel[R.k];
 }
 
 function updateZone() {
@@ -1028,10 +1139,14 @@ function updateDyn(dt) {
     const c = chunks.get(ckey(ccx + dx, ccy + dy));
     if (!c || !c.done) continue;
     for (const o of c.dyn) {
-      if (Math.abs(o.vx) + Math.abs(o.vy) + Math.abs(o.va) < 0.5) continue;
-      o.x += o.vx * dt; o.y += o.vy * dt; o.a += o.va * dt;
-      const f = Math.exp(-2.6 * dt);
-      o.vx *= f; o.vy *= f; o.va *= Math.exp(-2 * dt);
+      if (o.animal) animalAI(o, dt);
+      else if (Math.abs(o.vx) + Math.abs(o.vy) + Math.abs(o.va) < 0.5) continue;
+      o.x += o.vx * dt; o.y += o.vy * dt;
+      if (!o.animal) {
+        o.a += o.va * dt;
+        const f = Math.exp(-2.6 * dt);
+        o.vx *= f; o.vy *= f; o.va *= Math.exp(-2 * dt);
+      }
       for (const s of c.statics) {
         if (s.t === 'house') continue;
         const ddx = o.x - s.x, ddy = o.y - s.y, d = Math.hypot(ddx, ddy), md = o.r + s.r * 0.75;
@@ -1043,6 +1158,38 @@ function updateDyn(dt) {
         }
       }
     }
+  }
+}
+
+// Tiere grasen, schlendern umher, bleiben auf ihrer Weide und weichen dem Auto aus.
+// Stöße (aus collide) wirken über die Geschwindigkeit und klingen über die Angleichung ab.
+function animalAI(o, dt) {
+  const sheep = o.t === 'sheep';
+  const dx = o.x - car.x, dy = o.y - car.y, dc = Math.hypot(dx, dy);
+  const carSpeed = Math.hypot(car.vx, car.vy);
+  let tvx = 0, tvy = 0;
+  if (!car.upper && dc < (sheep ? 150 : 90) && (carSpeed > 20 || dc < 50)) {
+    const sp = sheep ? 75 : 45;                     // Flucht, aber nicht über den Weiderand hinaus
+    if (surfAtFast(o.x + dx / dc * 22, o.y + dy / dc * 22) === S_PASTURE) { tvx = dx / dc * sp; tvy = dy / dc * sp; }
+  } else {
+    o.timer -= dt;
+    if (o.timer <= 0) {
+      o.timer = 1.5 + Math.random() * 4;
+      o.walk = Math.random() < 0.45 ? 0 : sheep ? 14 : 9;   // grasen oder gehen
+      o.a += (Math.random() - .5) * 2.4;
+    }
+    tvx = Math.cos(o.a) * o.walk; tvy = Math.sin(o.a) * o.walk;
+    if (o.walk && surfAtFast(o.x + Math.cos(o.a) * 22, o.y + Math.sin(o.a) * 22) !== S_PASTURE) {
+      o.a += Math.PI; tvx = -tvx; tvy = -tvy;          // Weidegrenze: umdrehen
+    }
+  }
+  const k = Math.min(1, dt * 2.5);
+  o.vx += (tvx - o.vx) * k; o.vy += (tvy - o.vy) * k;
+  const sp = Math.hypot(o.vx, o.vy);
+  if (sp > 4) {                                     // in Laufrichtung drehen
+    let da = Math.atan2(o.vy, o.vx) - o.a;
+    da = Math.atan2(Math.sin(da), Math.cos(da));
+    o.a += da * Math.min(1, dt * 5);
   }
 }
 
@@ -1131,7 +1278,7 @@ function updateCamera(dt) {
 }
 
 // ---------- Zeichnen ----------
-const SHADOW_H = { tree: 8, pine: 9, cactus: 5, bush: 3, rock: 3, stump: 2, cone: 2, barrel: 3, crate: 3, bale: 4 };
+const SHADOW_H = { tree: 8, pine: 9, cactus: 5, bush: 3, rock: 3, stump: 2, cone: 2, barrel: 3, crate: 3, bale: 4, sheep: 3, cow: 4 };
 const HIGH = { tree: 1, pine: 1, house: 1, cactus: 1 };
 
 function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill(); }
@@ -1171,9 +1318,9 @@ function drawStatic(o) {
       break;
     }
     case 'bush': {
-      ctx.fillStyle = o.dead ? '#6b5a3c' : o.heath ? '#7a5a7e' : '#3f7a3a';
+      ctx.fillStyle = o.dead ? '#6b5a3c' : '#3f7a3a';
       circle(o.x - o.r * .35, o.y, o.r * .7); circle(o.x + o.r * .35, o.y + o.r * .1, o.r * .65); circle(o.x, o.y - o.r * .35, o.r * .65);
-      ctx.fillStyle = o.dead ? '#86724d' : o.heath ? '#a57aa8' : '#579a4c';
+      ctx.fillStyle = o.dead ? '#86724d' : '#579a4c';
       circle(o.x - o.r * .2, o.y - o.r * .4, o.r * .35);
       break;
     }
@@ -1249,6 +1396,29 @@ function drawDyn(o) {
       ctx.strokeRect(-8, -8, 16, 16);
       ctx.beginPath(); ctx.moveTo(-8, -8); ctx.lineTo(8, 8); ctx.moveTo(8, -8); ctx.lineTo(-8, 8); ctx.stroke();
       break;
+    case 'sheep': {
+      ctx.fillStyle = o.c === '#3a3633' ? '#4a4540' : o.c;          // gelegentlich ein schwarzes Schaf
+      circle(-3, -2.5, 4.2); circle(-3, 2.5, 4.2); circle(1.5, -2, 4); circle(1.5, 2, 4); circle(-0.5, 0, 4.6);
+      ctx.fillStyle = 'rgba(255,255,255,0.35)'; circle(-1.5, -2, 2);
+      ctx.fillStyle = '#2b2725'; ctx.beginPath(); ctx.ellipse(7, 0, 3, 2.4, 0, 0, TAU); ctx.fill();
+      ctx.fillRect(6, -3.6, 1.8, 1.2); ctx.fillRect(6, 2.4, 1.8, 1.2);       // Ohren
+      break;
+    }
+    case 'cow': {
+      const spot = o.c === '#f4f2ee' ? '#2e2a28' : null;
+      ctx.fillStyle = o.c; ctx.beginPath(); ctx.ellipse(-1, 0, 11, 6.5, 0, 0, TAU); ctx.fill();
+      if (spot) {
+        ctx.fillStyle = spot;
+        ctx.beginPath(); ctx.ellipse(-6 + o.spots[0] * 4, -2, 3.5, 2.6, o.spots[1], 0, TAU); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(2 + o.spots[1] * 3, 2.5, 3, 2.2, o.spots[2], 0, TAU); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(-2, -4 + o.spots[2] * 2, 2, 1.6, 0, 0, TAU); ctx.fill();
+      }
+      ctx.fillStyle = o.c === '#2e2a28' ? '#3e3836' : o.c === '#8a5a3a' ? '#7a4e32' : '#e8e4dc';
+      ctx.beginPath(); ctx.ellipse(11, 0, 4, 3.4, 0, 0, TAU); ctx.fill();        // Kopf
+      ctx.fillStyle = '#e8b4a8'; ctx.fillRect(13.5, -1.8, 2, 3.6);              // Maul
+      ctx.fillStyle = '#e9e1cc'; ctx.fillRect(9.5, -5, 1.6, 2); ctx.fillRect(9.5, 3, 1.6, 2); // Hörner
+      break;
+    }
     case 'bale':
       ctx.fillStyle = o.c; circle(0, 0, o.r);
       ctx.strokeStyle = '#b39443'; ctx.lineWidth = 1.2;
@@ -1279,6 +1449,27 @@ function drawDeck(z) {
     polyLine(ctx, s, s.half + 2.5, 3, '#dcd6c8', null, preds[i]);
   });
   ctx.setLineDash([]);
+}
+
+// Betonportal quer über die Fahrbahn mit dunkler Tunnelöffnung davor
+function drawPortals(s) {
+  const w = s.half + s.sh + TUNNEL_EXTRA;
+  for (const [a, b] of s.tunnels) {
+    for (const [k, inward] of [[a, 1], [b, -1]]) {
+      if (k === 0 || k === s.n - 1) continue; // Tunnel geht im Nachbarsegment weiter
+      const x = s.xs[k], y = s.ys[k], nx = s.nx[k], ny = s.ny[k];
+      const tx = ny * inward, ty = -nx * inward; // zeigt in den Tunnel hinein
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.beginPath();
+      ctx.moveTo(x + nx * (w - 4), y + ny * (w - 4)); ctx.lineTo(x - nx * (w - 4), y - ny * (w - 4));
+      ctx.lineTo(x - nx * (w - 4) + tx * 14, y - ny * (w - 4) + ty * 14); ctx.lineTo(x + nx * (w - 4) + tx * 14, y + ny * (w - 4) + ty * 14);
+      ctx.fill();
+      ctx.strokeStyle = '#c4beb2'; ctx.lineWidth = 9; ctx.lineCap = 'butt'; ctx.setLineDash([]);
+      ctx.beginPath(); ctx.moveTo(x + nx * w, y + ny * w); ctx.lineTo(x - nx * w, y - ny * w); ctx.stroke();
+      ctx.strokeStyle = '#8f8a80'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(x + nx * w - tx * 4, y + ny * w - ty * 4); ctx.lineTo(x - nx * w - tx * 4, y - ny * w - ty * 4); ctx.stroke();
+    }
+  }
 }
 
 function rrect(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); ctx.fill(); }
@@ -1359,6 +1550,19 @@ function render() {
       if (c && c.done) for (const z of c.crossings) decks.add(z);
     }
   }
+  // Tunneldächer: über dem Auto, halbtransparent solange es selbst im Tunnel fährt
+  const tsegs = new Set();
+  ctx.globalAlpha = car.inTunnel ? 0.5 : 1;
+  for (let cy = Math.floor(y0 / CS); cy <= Math.floor(y1 / CS); cy++) {
+    for (let cx = Math.floor(x0 / CS); cx <= Math.floor(x1 / CS); cx++) {
+      const c = chunks.get(ckey(cx, cy));
+      if (!c || !c.done) continue;
+      if (c.roof) ctx.drawImage(c.roof, cx * CS, cy * CS, CS + 1, CS + 1);
+      for (const v of c.segs) if (v.seg.tunnels.length) tsegs.add(v.seg);
+    }
+  }
+  ctx.globalAlpha = 1;
+  for (const s of tsegs) drawPortals(s);
   for (const z of decks) drawDeck(z);
   if (car.upper) drawCar();
   for (const q of particles) {
@@ -1444,6 +1648,7 @@ function updateHud() {
   if (z && car.upper) { road = z.up; extra = ' · Überführung'; }
   else if (z && segNearest(z.loV, car.x, car.y).d < z.lo.half &&
            segNearest(z.upV, car.x, car.y).d < z.up.half) { road = z.lo; extra = ' · Unterführung'; }
+  if (car.inTunnel) { road = R.seg; extra = ' · Tunnel'; }
   if (road) {
     name = (road.mtn && road.net === 1 ? 'Gebirgsstraße' : RT[road.type].name) + extra;
     col = road.type === 'track' ? SURF[S_GRAVEL].rgb : [86, 88, 94];
