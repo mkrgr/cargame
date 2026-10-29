@@ -902,7 +902,7 @@ function workChunks(budgetMs) {
 // ---------- Auto ----------
 const CAR_COLORS = ['#e8432e', '#2f7de1', '#f2b705', '#2bb673', '#f3f3f0', '#8e4fc4', '#1f2329'];
 const car = { x: 0, y: 0, a: 0, vx: 0, vy: 0, w: 0, steer: 0, vf: 0, vl: 0, color: 0,
-  braking: false, reversing: false, zone: null, upper: false, ws: [S_ASPHALT, S_ASPHALT, S_ASPHALT, S_ASPHALT], prevW: [null, null, null, null] };
+  braking: false, reversing: false, zone: null, upper: false, bloody: 0, ws: [S_ASPHALT, S_ASPHALT, S_ASPHALT, S_ASPHALT], prevW: [null, null, null, null] };
 const WHEELS = [[14, -10], [14, 10], [-14, -10], [-14, 10]]; // vorne links/rechts, hinten links/rechts
 const TOP = 560, ACC = 430, REV_TOP = 190, REV_ACC = 300, BRAKE = 950;
 const KMH = 0.25;
@@ -1103,8 +1103,14 @@ function collide() {
     }
 
     for (const o of nearDyn) {
+      if (o.dead) continue;
       const dx = o.x - px, dy = o.y - py, d = Math.hypot(dx, dy), md = CR + o.r;
       if (d >= md || d < 1e-4) continue;
+      // Tier mittig vor (oder hinter) dem Auto und Tempo drauf: überfahren statt wegschieben
+      if (o.animal && Math.abs(car.vf) > RUNOVER_SPEED) {
+        const lat = Math.abs((o.x - car.x) * -fy + (o.y - car.y) * fx);
+        if (lat < (o.t === 'cow' ? 8 : 6)) { runOver(o, fx * Math.sign(car.vf), fy * Math.sign(car.vf)); continue; }
+      }
       const nx = dx / d, ny = dy / d, pen = md - d, tm = 1 + o.m;
       o.x += nx * pen / tm; o.y += ny * pen / tm;
       car.x -= nx * pen * o.m / tm; car.y -= ny * pen * o.m / tm;
@@ -1138,6 +1144,7 @@ function updateDyn(dt) {
   for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
     const c = chunks.get(ckey(ccx + dx, ccy + dy));
     if (!c || !c.done) continue;
+    if (c.dyn.some(o => o.dead)) c.dyn = c.dyn.filter(o => !o.dead);
     for (const o of c.dyn) {
       if (o.animal) animalAI(o, dt);
       else if (Math.abs(o.vx) + Math.abs(o.vy) + Math.abs(o.va) < 0.5) continue;
@@ -1157,6 +1164,46 @@ function updateDyn(dt) {
           if (vn < 0) { o.vx -= 1.4 * vn * nx; o.vy -= 1.4 * vn * ny; }
         }
       }
+    }
+  }
+}
+
+const RUNOVER_SPEED = 60; // px/s, entspricht 15 km/h
+function runOver(o, dirx, diry) {
+  o.dead = true;
+  const big = o.t === 'cow' ? 1.6 : 1;
+  paintGround(o.x, o.y, 40 * big, g => {
+    // verschmierter Fleck in Fahrtrichtung
+    for (let i = 0; i < 9; i++) {
+      const f = Math.random();
+      const x = o.x + dirx * f * 26 * big + (Math.random() - .5) * 10 * big;
+      const y = o.y + diry * f * 26 * big + (Math.random() - .5) * 10 * big;
+      g.fillStyle = `rgba(${120 + Math.random() * 40 | 0},10,12,${0.55 + Math.random() * 0.3})`;
+      g.beginPath(); g.ellipse(x, y, (5 + Math.random() * 6) * big, (3 + Math.random() * 4) * big, Math.atan2(diry, dirx), 0, TAU); g.fill();
+    }
+    g.fillStyle = 'rgba(90,6,8,0.7)';
+    g.beginPath(); g.arc(o.x, o.y, 6 * big, 0, TAU); g.fill();
+  });
+  for (let k = 0; k < 18; k++) {
+    const a = Math.atan2(diry, dirx) + (Math.random() - .5) * 2.2, s = 40 + Math.random() * 140;
+    emit(o.x, o.y, Math.cos(a) * s, Math.sin(a) * s, 'rgba(170,16,20,', 1.5 + Math.random() * 2, .5 + Math.random() * .3);
+  }
+  if (o.t === 'sheep') for (let k = 0; k < 10; k++) {
+    const a = Math.random() * TAU, s = 20 + Math.random() * 60;
+    emit(o.x, o.y, Math.cos(a) * s, Math.sin(a) * s, 'rgba(245,242,232,', 2 + Math.random() * 2, .9);
+  }
+  car.vx *= o.t === 'cow' ? 0.8 : 0.93; car.vy *= o.t === 'cow' ? 0.8 : 0.93;
+  shake = Math.max(shake, o.t === 'cow' ? 5 : 2.5);
+  car.bloody = 2.5; // Sekunden mit roter Reifenspur
+}
+
+// Zeichnet etwas dauerhaft auf den Boden aller betroffenen Chunks (Weltkoordinaten)
+function paintGround(x, y, rad, fn) {
+  for (let cy = Math.floor((y - rad) / CS); cy <= Math.floor((y + rad) / CS); cy++) {
+    for (let cx = Math.floor((x - rad) / CS); cx <= Math.floor((x + rad) / CS); cx++) {
+      const c = chunks.get(ckey(cx, cy));
+      if (!c || !c.done) continue;
+      c.ctx.save(); c.ctx.translate(-cx * CS, -cy * CS); fn(c.ctx); c.ctx.restore();
     }
   }
 }
@@ -1217,6 +1264,7 @@ function emit(x, y, vx, vy, color, size, life) {
 function effects(dt) {
   const fx = Math.cos(car.a), fy = Math.sin(car.a), rx = -fy, ry = fx;
   const speed = Math.hypot(car.vx, car.vy);
+  car.bloody = Math.max(0, car.bloody - dt);
   const slipping = Math.abs(car.vl) > 70 || (keys.hand && speed > 60) ||
                    (car.braking && speed > 120 && SURF[car.ws[2]].brake < .6);
   for (let i = 0; i < 4; i++) {
@@ -1228,6 +1276,8 @@ function effects(dt) {
       if (p.track && speed > 4) stamp(prev[0], prev[1], x, y, p.track, 4);
       else if (p.skid && (slipping || (car.braking && speed > 200 && i >= 2))) stamp(prev[0], prev[1], x, y, p.skid, 4);
     }
+    if (car.bloody > 0 && prev && speed > 4 && Math.hypot(x - prev[0], y - prev[1]) < 60)
+      stamp(prev[0], prev[1], x, y, `rgba(120,12,14,${(0.45 * Math.min(1, car.bloody / 2.5)).toFixed(3)})`, 4);
     car.prevW[i] = [x, y];
 
     if (i < 2) continue; // Partikel nur an den Hinterrädern
