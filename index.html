@@ -1697,6 +1697,7 @@ const CAR_TYPES = [
   { id: 'dmc',    name: 'DeLorean',   color: '#b9bec4', mode: ['Flammen aus', 'Flammen an'] },
   { id: 'van',    name: 'A-Team-Van', color: '#26292e', mode: ['Geschützturm eingefahren', 'Geschützturm feuert'] },
   { id: 'homer',  name: 'Homers Auto', color: '#e9a0ac', mode: ['Brennstäbe behalten', 'wirft Brennstäbe'] },
+  { id: 'interceptor', name: 'Pursuit Special', color: '#16171a', mode: ['Revenge aus', 'Revenge an'] },
 ];
 const AIR_TIME = 1.0, BOOST_COOLDOWN = 3, FLAME_KMH = 88;
 // Geschützturm des Vans: Winkel relativ zum Fahrzeug, Ausfahrgrad 0..1
@@ -2106,9 +2107,10 @@ function collide() {
       const dx = o.x - px, dy = o.y - py, d = Math.hypot(dx, dy), md = CR + o.r;
       if (d >= md || d < 1e-4) continue;
       // Tier mittig vor (oder hinter) dem Auto und Tempo drauf: überfahren statt wegschieben
-      if (o.animal && Math.abs(car.vf) > RUNOVER_SPEED) {
+      // Überfahren nur mit dem Pursuit Special im Revenge-Modus, sonst wird nur geschoben
+      if ((o.animal || o.person) && revenge() && Math.abs(car.vf) > RUNOVER_SPEED) {
         const lat = Math.abs((o.x - car.x) * -fy + (o.y - car.y) * fx);
-        if (lat < (o.t === 'cow' ? 8 : 6)) { runOver(o, fx * Math.sign(car.vf), fy * Math.sign(car.vf)); continue; }
+        if (lat < (o.t === 'cow' ? 8 : o.person ? 12 : 6)) { runOver(o, fx * Math.sign(car.vf), fy * Math.sign(car.vf)); continue; }
       }
       const nx = dx / d, ny = dy / d, pen = md - d, tm = 1 + o.m;
       o.x += nx * pen / tm; o.y += ny * pen / tm;
@@ -2179,9 +2181,10 @@ function updateDyn(dt) {
 }
 
 const RUNOVER_SPEED = 60; // px/s, entspricht 15 km/h
+const revenge = () => CAR_TYPES[car.type].id === 'interceptor' && car.mode;
 function runOver(o, dirx, diry) {
   o.dead = true;
-  const big = o.t === 'cow' ? 1.6 : 1;
+  const big = o.t === 'cow' ? 1.6 : o.t === 'person' ? 0.8 : 1;
   paintGround(o.x, o.y, 40 * big, g => {
     // verschmierter Fleck in Fahrtrichtung
     for (let i = 0; i < 9; i++) {
@@ -2238,13 +2241,17 @@ function personAI(o, dt) {
   const dx = o.x - car.x, dy = o.y - car.y, dc = Math.hypot(dx, dy), cs = Math.hypot(car.vx, car.vy);
   let speed = o.walk;
   let dodge = false;
-  if (!car.upper && dc < 120 && cs > 40) {
+  // Revenge: spätere, langsamere Reaktion, und manche erstarren vor Schreck
+  const rv = revenge();
+  if (o.frozen === undefined) o.frozen = Math.random() < 0.4;
+  if (!car.upper && dc < (rv ? 70 : 120) && cs > 40 && !(rv && o.frozen)) {
     const ux = car.vx / cs, uy = car.vy / cs, ahead = dx * ux + dy * uy, lat = -dx * uy + dy * ux;
     if (ahead > -15 && Math.abs(lat) < 45) {                        // in der Bahn des Autos: Sprung zur Seite
       const side = lat >= 0 ? 1 : -1;
-      o.a = Math.atan2(ux * side, -uy * side); speed = 110; dodge = true;
+      o.a = Math.atan2(ux * side, -uy * side); speed = rv ? 55 : 110; dodge = true;
     }
   }
+  const freeze = rv && o.frozen && dc < 120 && cs > 40;              // starr vor Schreck
   const surf = surfAtFast(o.x, o.y);
   if (!dodge) {
     if (o.cross > 0) {                                              // beim Überqueren
@@ -2281,6 +2288,7 @@ function personAI(o, dt) {
       }
     }
   }
+  if (freeze) speed = 0;
   const tx = Math.cos(o.a) * speed, ty = Math.sin(o.a) * speed, k = Math.min(1, dt * (dodge ? 12 : 6));
   o.vx += (tx - o.vx) * k; o.vy += (ty - o.vy) * k;
   o.phase += Math.hypot(o.vx, o.vy) * dt * 0.45;
@@ -2386,6 +2394,13 @@ function effects(dt) {
     }
   }
 
+  if (revenge() && car.throttle > 0 && car.air <= 0) {              // Flammen aus den Seitenrohren
+    for (const sd of [-1, 1]) if (Math.random() < 0.7) {
+      const ex = car.x - fx * 8 + rx * 13.5 * sd, ey = car.y - fy * 8 + ry * 13.5 * sd;
+      emit(ex, ey, -fx * 90 + rx * sd * 20 + car.vx * 0.8, -fy * 90 + ry * sd * 20 + car.vy * 0.8,
+           Math.random() < .5 ? 'rgba(255,150,40,' : 'rgba(255,220,110,', 2 + Math.random() * 2, 0.18);
+    }
+  }
   if (impactAcc > 40) {
     shake = Math.max(shake, Math.min(10, impactAcc / 50));
     for (let k = 0; k < Math.min(14, impactAcc / 20); k++) {
@@ -3015,6 +3030,30 @@ function drawCar() {
       }
       break;
     }
+    case 'interceptor': {                                            // schwarzer Pursuit Special mit Kompressor
+      ctx.fillStyle = '#c9ccd0';                                     // seitliche Auspuffrohre
+      for (const sd of [-1, 1]) {
+        ctx.fillRect(-8, sd * 12.4 - 1.1, 18, 2.2);
+        ctx.fillStyle = '#2a2c30'; ctx.fillRect(-8.5, sd * 12.4 - 1.1, 1.5, 2.2); ctx.fillStyle = '#c9ccd0';
+      }
+      ctx.fillStyle = '#16171a'; rrect(-23, -12, 45, 24, 5);
+      ctx.fillStyle = '#0d0e10'; rrect(19, -9.5, 5.5, 19, 3);         // Aero-Bugnase
+      ctx.fillStyle = 'rgba(255,255,255,0.13)'; rrect(-21, -10, 40, 4.5, 2.5);
+      ctx.fillStyle = glass;
+      ctx.beginPath(); ctx.moveTo(-1, -9.5); ctx.lineTo(4.5, -8.2); ctx.lineTo(4.5, 8.2); ctx.lineTo(-1, 9.5); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#16171a'; rrect(-12.5, -8.6, 11.8, 17.2, 2);   // Dach
+      ctx.fillStyle = glass; ctx.fillRect(-15.5, -7.4, 3, 14.8);      // Heckscheibe
+      ctx.fillStyle = '#0b0b0d'; ctx.fillRect(-13, -8.6, 1.6, 17.2);  // Dachspoiler
+      ctx.fillStyle = '#0b0b0d'; ctx.fillRect(-25, -12.5, 3, 25);     // Heckflügel mit Endplatten
+      ctx.fillRect(-25.5, -13, 5, 2); ctx.fillRect(-25.5, 11, 5, 2);
+      ctx.fillStyle = '#c9ccd0'; rrect(6, -4.2, 10, 8.4, 2);          // Kompressor durch die Haube
+      ctx.fillStyle = '#8d9196'; for (let x = 7.5; x < 15; x += 2) ctx.fillRect(x, -4.2, 0.8, 8.4);
+      ctx.fillStyle = '#2a2c30'; ctx.fillRect(11, -2.8, 4.5, 5.6);    // Ansaughutze
+      ctx.fillStyle = car.mode ? '#ff3a1a' : '#4a4d52'; ctx.fillRect(12, -1.6, 2.5, 3.2);
+      if (car.mode) { ctx.fillStyle = 'rgba(255,60,20,0.35)'; circle(13, 0, 6); }
+      ctx.fillStyle = '#1f2023'; ctx.fillRect(15.5, -3.2, 1.2, 6.4);  // Riemen
+      break;
+    }
     case 'homer': {                                                  // rosa Limousine mit Dellen und Grundierung
       sedan('#e9a0ac', '#e9a0ac');
       ctx.fillStyle = '#9a9c98'; rrect(12, -9, 8, 7, 2);             // graue Grundierungsstelle an der Haube
@@ -3262,6 +3301,10 @@ function specialLights() {
   }
   if (id === 'bond' && bond.flash > 0 && bond.open > 0.9)
     out.push({ x: car.x + fx * 30, y: car.y + fy * 30, r: 100, cut: 0.55, glow: 0.35, col: rgba(255, 190, 90) });
+  if (id === 'interceptor' && car.mode && car.throttle > 0) {
+    const rx = -fy, ry = fx;
+    for (const sd of [-1, 1]) out.push({ x: car.x - fx * 12 + rx * 13.5 * sd, y: car.y - fy * 12 + ry * 13.5 * sd, r: 45, cut: 0.4, glow: 0.3, col: rgba(255, 140, 40) });
+  }
   if (id === 'van' && turret.flash > 0) {
     const a = car.a + turret.ang, bx = car.x + fx * TURRET_X + Math.cos(a) * 19, by = car.y + fy * TURRET_X + Math.sin(a) * 19;
     out.push({ x: bx, y: by, r: 110, cut: 0.6, glow: 0.35, col: rgba(255, 190, 90) });
