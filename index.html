@@ -120,30 +120,145 @@ const SURF = [
   { name: 'Brücke',         rgb: [138, 100, 64],  grip: 7,   accel: .95, top: .9,  drag: .2,  brake: .9, skid: 'rgba(40,28,18,0.3)' },
 ];
 
-const ROAD_W = 26; // halbe Straßenbreite
-let lastE = 0, lastM = 0, lastRD = 0;
+let lastE = 0, lastM = 0;
 
 function elev(x, y) { return fbm(x / 650, y / 650, SEED, 4); }
+function forestAt(x, y) { return fbm(x / 450, y / 450, SEED + 61, 2); }
 
-// Abstand zur 0.5-Höhenlinie eines Rauschfeldes -> Straßen mit konstanter Breite
-function roadDist(x, y, s, sc) {
-  const v = fbm(x / sc, y / sc, s, 2);
-  const dv = Math.abs(v - 0.5);
-  if (dv > 0.07) return 999;
-  const gx = (fbm((x + 2) / sc, y / sc, s, 2) - v) / 2;
-  const gy = (fbm(x / sc, (y + 2) / sc, s, 2) - v) / 2;
-  return dv / Math.max(1e-6, Math.hypot(gx, gy));
+// ---------- Straßennetz ----------
+// Drei Netze auf unterschiedlich groben Gittern: verschobene Knoten, verbunden durch Bézierkurven
+// mit stetigen Tangenten. Autobahnen laufen als durchgehende Zeilen/Spalten durch die ganze Welt.
+const NETS = [
+  { cell: 4200, jit: 0.22 }, // Autobahnen
+  { cell: 1300, jit: 0.33 }, // Land- und Nebenstraßen
+  { cell: 620,  jit: 0.38 }, // Waldwege
+];
+const RT = {
+  hw:    { half: 42, sh: 8, col: '#4b4d53', name: 'Autobahn' },
+  road:  { half: 22, sh: 6, col: '#56585e', name: 'Landstraße' },
+  lane:  { half: 16, sh: 4, col: '#68696d', name: 'Nebenstraße' },
+  track: { half: 10, sh: 0, col: '#a08f70', name: 'Waldweg' },
+};
+const segCache = new Map();
+const NO_ROADS = [];
+
+function roadNode(net, i, j) {
+  const n = NETS[net];
+  return [(i + .5 + (hash(i, j, SEED + net * 7 + 1) - .5) * 2 * n.jit) * n.cell,
+          (j + .5 + (hash(i, j, SEED + net * 7 + 2) - .5) * 2 * n.jit) * n.cell];
+}
+function edgeExists(net, i, j, dir) {
+  if (net === 0) return dir ? hash(i, 0, SEED + 301) < 0.4 : hash(0, j, SEED + 300) < 0.4;
+  return hash(i, j, SEED + 310 + net * 2 + dir) < (net === 1 ? 0.68 : 0.6);
+}
+const WOODLAND = { [S_GRASS]: 1, [S_SNOW]: 1, [S_MUD]: 1 };
+function nodeDegree(net, i, j) {
+  return edgeExists(net, i, j, 0) + edgeExists(net, i - 1, j, 0) + edgeExists(net, i, j, 1) + edgeExists(net, i, j - 1, 1);
+}
+function nodeTangent(net, i, j, dir) {
+  const a = roadNode(net, dir ? i : i - 1, dir ? j - 1 : j), b = roadNode(net, dir ? i : i + 1, dir ? j + 1 : j);
+  const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy);
+  return [dx / l, dy / l];
+}
+function getSeg(net, i, j, dir) {
+  const key = net + '|' + i + '|' + j + '|' + dir;
+  let s = segCache.get(key);
+  if (s === undefined) { s = buildSeg(net, i, j, dir, key); segCache.set(key, s); }
+  return s;
+}
+function buildSeg(net, i, j, dir, key) {
+  if (!edgeExists(net, i, j, dir)) return null;
+  const i2 = dir ? i : i + 1, j2 = dir ? j + 1 : j;
+  const A = roadNode(net, i, j), B = roadNode(net, i2, j2);
+  const tA = nodeTangent(net, i, j, dir), tB = nodeTangent(net, i2, j2, dir);
+  const len = Math.hypot(B[0] - A[0], B[1] - A[1]), k = len * 0.36;
+  const P1 = [A[0] + tA[0] * k, A[1] + tA[1] * k], P2 = [B[0] - tB[0] * k, B[1] - tB[1] * k];
+  const n = Math.max(6, Math.ceil(len / 14)) + 1;
+  const xs = new Float32Array(n), ys = new Float32Array(n), nx = new Float32Array(n), ny = new Float32Array(n);
+  const water = new Uint8Array(n);
+  let forest = 0, wet = 0;
+  for (let q = 0; q < n; q++) {
+    const t = q / (n - 1), u = 1 - t, b0 = u * u * u, b1 = 3 * u * u * t, b2 = 3 * u * t * t, b3 = t * t * t;
+    xs[q] = b0 * A[0] + b1 * P1[0] + b2 * P2[0] + b3 * B[0];
+    ys[q] = b0 * A[1] + b1 * P1[1] + b2 * P2[1] + b3 * B[1];
+    if (elev(xs[q], ys[q]) < 0.37) { water[q] = 1; wet++; }
+    if (net === 2 && forestAt(xs[q], ys[q]) > 0.52 && WOODLAND[surfaceAt(xs[q], ys[q], NO_ROADS)]) forest++;
+  }
+  // Waldwege nur durch Wald und nie durchs Wasser
+  if (net === 2 && (wet > 0 || forest < n * 0.6)) return null;
+  let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
+  for (let q = 0; q < n; q++) {
+    const a = Math.max(0, q - 1), b = Math.min(n - 1, q + 1);
+    const tx = xs[b] - xs[a], ty = ys[b] - ys[a], l = Math.hypot(tx, ty) || 1;
+    nx[q] = -ty / l; ny[q] = tx / l; // zeigt in Fahrtrichtung nach rechts
+    minx = Math.min(minx, xs[q]); maxx = Math.max(maxx, xs[q]); miny = Math.min(miny, ys[q]); maxy = Math.max(maxy, ys[q]);
+  }
+  // Sackgassen sind immer kleine Nebenstraßen
+  const deadEnd = net === 1 && (nodeDegree(net, i, j) < 2 || nodeDegree(net, i2, j2) < 2);
+  const type = net === 0 ? 'hw' : net === 1 ? (!deadEnd && hash(i, j, SEED + 330 + dir) < 0.6 ? 'road' : 'lane') : 'track';
+  const rt = RT[type];
+  return { key, net, type, half: rt.half, sh: rt.sh, col: rt.col, xs, ys, nx, ny, water, n,
+           hasWater: wet > 0, minx, miny, maxx, maxy };
 }
 
-function surfaceAt(x, y) {
+// Alle Segmente nahe eines Rechtecks, jeweils auf den relevanten Stützpunktbereich beschnitten
+function segsNear(x0, y0, x1, y1) {
+  const out = [];
+  for (let net = 0; net < 3; net++) {
+    const cell = NETS[net].cell;
+    for (let j = Math.floor(y0 / cell) - 2; j <= Math.floor(y1 / cell) + 1; j++) {
+      for (let i = Math.floor(x0 / cell) - 2; i <= Math.floor(x1 / cell) + 1; i++) {
+        for (let dir = 0; dir < 2; dir++) {
+          const s = getSeg(net, i, j, dir);
+          if (!s) continue;
+          const m = s.half + s.sh + 60;
+          if (s.maxx < x0 - m || s.minx > x1 + m || s.maxy < y0 - m || s.miny > y1 + m) continue;
+          let i0 = -1, i1 = -1;
+          for (let k = 0; k < s.n; k++) {
+            const x = s.xs[k], y = s.ys[k];
+            if (x >= x0 - m && x <= x1 + m && y >= y0 - m && y <= y1 + m) { if (i0 < 0) i0 = k; i1 = k; }
+          }
+          if (i0 >= 0) out.push({ seg: s, i0: Math.max(0, i0 - 1), i1: Math.min(s.n - 1, i1 + 1) });
+        }
+      }
+    }
+  }
+  out.sort((a, b) => b.seg.net - a.seg.net || (a.seg.key < b.seg.key ? -1 : a.seg.key > b.seg.key ? 1 : 0));
+  return out;
+}
+
+// Vorzeichenbehafteter Abstand zum Fahrbahnrand (negativ = auf der Fahrbahn)
+const RQ = { edge: 1e9, seg: null };
+function roadQuery(x, y, views) {
+  let best = 1e9, bs = null;
+  for (const v of views) {
+    const s = v.seg, m = s.half + s.sh + 16;
+    if (x < s.minx - m || x > s.maxx + m || y < s.miny - m || y > s.maxy + m) continue;
+    const xs = s.xs, ys = s.ys;
+    for (let k = v.i0; k < v.i1; k++) {
+      const ax = xs[k], ay = ys[k];
+      if (Math.abs(x - ax) > m || Math.abs(y - ay) > m) continue;
+      const bx = xs[k + 1] - ax, by = ys[k + 1] - ay, px = x - ax, py = y - ay;
+      const t = clamp((px * bx + py * by) / (bx * bx + by * by), 0, 1);
+      const d = Math.hypot(px - bx * t, py - by * t) - s.half;
+      if (d < best) { best = d; bs = s; }
+    }
+  }
+  RQ.edge = best; RQ.seg = bs;
+  return RQ;
+}
+
+function surfaceAt(x, y, views) {
   const e = elev(x, y);
   const t = fbm(x / 2400, y / 2400, SEED + 31, 3);
-  const cold = t < 0.39;
-  const rd = Math.min(roadDist(x, y, SEED + 11, 1100), roadDist(x + 5000, y - 3000, SEED + 23, 1500));
-  lastE = e; lastRD = rd;
-  if (rd < ROAD_W) return e < 0.37 ? S_BRIDGE : S_ASPHALT;
-  if (e < 0.37) return cold ? S_ICE : (e < 0.33 ? S_DEEP : S_SHALLOW);
-  if (rd < ROAD_W + 10) return S_GRAVEL;
+  const cold = t < 0.39, water = e < 0.37;
+  const R = roadQuery(x, y, views || segsNear(x, y, x, y));
+  lastE = e;
+  if (R.seg) {
+    if (R.edge < 0) return R.seg.type === 'track' ? S_GRAVEL : (water ? S_BRIDGE : S_ASPHALT);
+    if (R.edge < R.seg.sh && !water) return S_GRAVEL;
+  }
+  if (water) return cold ? S_ICE : (e < 0.33 ? S_DEEP : S_SHALLOW);
   if (e < 0.395) return cold ? S_SNOW : S_SAND;
   const m = fbm(x / 800, y / 800, SEED + 47, 3);
   lastM = m;
@@ -162,10 +277,11 @@ let frameNo = 0;
 let spawn = { x: 0, y: 0, a: 0 };
 
 function newChunk(cx, cy) {
-  const s = surfaceAt((cx + .5) * CS, (cy + .5) * CS);
+  const segs = segsNear(cx * CS, cy * CS, (cx + 1) * CS, (cy + 1) * CS);
+  const s = surfaceAt((cx + .5) * CS, (cy + .5) * CS, segs);
   const p = SURF[s].rgb;
   return {
-    cx, cy, done: false, row: 0, lastUsed: frameNo,
+    cx, cy, segs, done: false, row: 0, lastUsed: frameNo,
     surf: new Uint8Array(CN * CN), img: new ImageData(CN, CN),
     canvas: null, statics: [], dyn: [],
     fallback: `rgb(${p[0]},${p[1]},${p[2]})`,
@@ -178,7 +294,7 @@ function genRows(c, n) {
   for (let j = c.row; j < end; j++) {
     for (let i = 0; i < CN; i++) {
       const wx = ox + (i + .5) * CELL, wy = oy + (j + .5) * CELL;
-      const s = surfaceAt(wx, wy);
+      const s = surfaceAt(wx, wy, c.segs);
       const idx = j * CN + i;
       c.surf[idx] = s;
       const p = SURF[s].rgb;
@@ -195,10 +311,6 @@ function genRows(c, n) {
       } else if (s === S_GRASS) {
         const k = 0.5 - lastM; // trockener = gelblicher
         r += k * 130; g += k * 30; b -= k * 20;
-      } else if (s === S_ASPHALT && lastRD > ROAD_W - 4) {
-        r = 214; g = 212; b = 198; v = 0.95 + 0.05 * n1;
-      } else if (s === S_BRIDGE && lastRD > ROAD_W - 5) {
-        r = 88; g = 58; b = 36; v = 1;
       } else if (s === S_ICE) {
         v = 0.95 + 0.1 * n1 + 0.12 * (lf - .5);
       }
@@ -221,8 +333,75 @@ function finalizeChunk(c) {
   g.drawImage(small, 0, 0, CS, CS);
   c.ctx = g;
   c.img = null;
+  drawRoads(c);
   genObstacles(c);
   c.done = true;
+}
+
+// Straßen als Vektorlinien in den Chunk zeichnen. Jedes Segment wird komplett gezeichnet,
+// damit Strichmarkierungen über Chunkgrenzen hinweg nahtlos weiterlaufen.
+const MARK = 'rgba(238,238,228,0.92)';
+function polyLine(g, s, off, w, col, dash, pred) {
+  g.lineWidth = w; g.strokeStyle = col; g.setLineDash(dash || []);
+  g.beginPath();
+  let open = false;
+  for (let k = 0; k < s.n; k++) {
+    if (pred && !pred(k)) { open = false; continue; }
+    const x = s.xs[k] + s.nx[k] * off, y = s.ys[k] + s.ny[k] * off;
+    if (open) g.lineTo(x, y); else { g.moveTo(x, y); open = true; }
+  }
+  g.stroke();
+}
+function drawMarkings(g, s) {
+  const h = s.half;
+  if (s.type === 'hw') {
+    polyLine(g, s, 0, 5, '#a3a8ae');                 // Mittelleitplanke
+    for (const sg of [-1, 1]) {
+      polyLine(g, s, sg * 6.5, 1.6, MARK);
+      polyLine(g, s, sg * 23, 1.6, MARK, [22, 26]);  // Fahrstreifenbegrenzung
+      polyLine(g, s, sg * (h - 3.5), 2, MARK);       // Randlinie
+    }
+  } else if (s.type === 'road') {
+    polyLine(g, s, 0, 1.8, MARK, [20, 22]);
+    polyLine(g, s, -(h - 3), 1.8, MARK);
+    polyLine(g, s, h - 3, 1.8, MARK);
+  } else if (s.type === 'track') {
+    polyLine(g, s, 0, 3, 'rgba(96,128,62,0.55)');    // Grasnarbe in der Mitte
+    polyLine(g, s, -5.5, 4, 'rgba(110,90,60,0.5)');  // Fahrspuren
+    polyLine(g, s, 5.5, 4, 'rgba(110,90,60,0.5)');
+  }
+}
+function drawRoads(c) {
+  const g = c.ctx;
+  g.save();
+  g.translate(-c.cx * CS, -c.cy * CS);
+  g.lineJoin = 'round';
+  const segs = c.segs.map(v => v.seg);
+  const wetPred = s => k => s.water[k] || s.water[k - 1] || s.water[k + 1];
+  for (const net of [2, 1, 0]) {
+    const list = segs.filter(s => s.net === net);
+    g.lineCap = 'butt';
+    for (const s of list) if (s.hasWater) {
+      g.save(); g.translate(7, 9);
+      polyLine(g, s, 0, s.half * 2 + 4, 'rgba(0,0,0,0.28)', null, wetPred(s));
+      g.restore();
+    }
+    g.lineCap = 'round';
+    for (const s of list) {
+      if (s.sh) polyLine(g, s, 0, (s.half + s.sh) * 2, '#9a8c74', null, k => !s.water[k]);
+      else polyLine(g, s, 0, s.half * 2 + 6, 'rgba(84,66,42,0.35)');
+    }
+    for (const s of list) polyLine(g, s, 0, s.half * 2, s.col);
+    g.lineCap = 'butt';
+    for (const s of list) drawMarkings(g, s);
+  }
+  for (const s of segs) if (s.hasWater) {
+    const p = wetPred(s);
+    polyLine(g, s, -(s.half + 1.5), 3, '#d9d3c5', null, p); // Brückengeländer
+    polyLine(g, s, s.half + 1.5, 3, '#d9d3c5', null, p);
+  }
+  g.setLineDash([]);
+  g.restore();
 }
 
 function localSurf(c, x, y) {
@@ -237,22 +416,26 @@ function genObstacles(c) {
   const rng = mulberry32(Math.floor(hash(c.cx, c.cy, SEED + 500) * 4294967296));
   const ox = c.cx * CS, oy = c.cy * CS;
   const S = c.statics, D = c.dyn;
-  const free = (x, y, r) => {
+  const free = (x, y, r, onRoad) => {
     if (Math.hypot(x - spawn.x, y - spawn.y) < 200) return false;
+    if (!onRoad) {
+      const R = roadQuery(x, y, c.segs);
+      if (R.seg && R.edge - R.seg.sh < r + 3) return false;
+    }
     for (const o of S) if (Math.hypot(o.x - x, o.y - y) < o.r + r + 8) return false;
     for (const o of D) if (Math.hypot(o.x - x, o.y - y) < o.r + r + 4) return false;
     return true;
   };
-  const addDyn = (t, x, y) => {
+  const addDyn = (t, x, y, onRoad) => {
     const def = DYN[t];
-    if (free(x, y, def.r)) D.push({ t, x, y, r: def.r, m: def.m, vx: 0, vy: 0, a: rng() * TAU, va: 0, c: def.colors[Math.floor(rng() * def.colors.length)] });
+    if (free(x, y, def.r, onRoad)) D.push({ t, x, y, r: def.r, m: def.m, vx: 0, vy: 0, a: rng() * TAU, va: 0, c: def.colors[Math.floor(rng() * def.colors.length)] });
   };
 
   for (let k = 0; k < 70; k++) {
     const x = ox + rng() * CS, y = oy + rng() * CS;
     const s = localSurf(c, x, y);
     const r = rng();
-    const forest = fbm(x / 450, y / 450, SEED + 61, 2);
+    const forest = forestAt(x, y);
     let o = null;
     if (s === S_GRASS) {
       const pt = forest > 0.56 ? 0.75 : 0.07;
@@ -276,13 +459,11 @@ function genObstacles(c) {
       if (r < 0.04) o = makeRock(rng, x, y);
     } else if (s === S_SHALLOW) {
       if (r < 0.06) o = makeRock(rng, x, y);
-    } else if (s === S_GRAVEL) {
-      if (r < 0.12) { addDyn('cone', x, y); continue; }
-      if (r < 0.17) { addDyn('barrel', x, y); continue; }
     } else if (s === S_ASPHALT) {
-      if (r < 0.04) {
+      // gelegentlich eine Baustelle: Pylonenreihe quer über einen Fahrstreifen
+      if (r < 0.03) {
         const a = rng() * TAU, n = 3 + Math.floor(rng() * 3);
-        for (let q = 0; q < n; q++) addDyn('cone', x + Math.cos(a) * q * 16, y + Math.sin(a) * q * 16);
+        for (let q = 0; q < n; q++) addDyn('cone', x + Math.cos(a) * q * 16, y + Math.sin(a) * q * 16, true);
         continue;
       }
     }
@@ -311,8 +492,10 @@ function makeRock(rng, x, y) {
 function tryHouse(c, rng, x, y) {
   const w = 50 + rng() * 34, h = 42 + rng() * 30;
   const pts = [[0, 0], [-w / 2, -h / 2], [w / 2, -h / 2], [-w / 2, h / 2], [w / 2, h / 2]];
-  for (const [dx, dy] of pts) if (surfaceAt(x + dx, y + dy) !== S_GRASS) return;
+  for (const [dx, dy] of pts) if (surfaceAt(x + dx, y + dy, c.segs) !== S_GRASS) return;
   const r = Math.hypot(w, h) / 2;
+  const R = roadQuery(x, y, c.segs);
+  if (R.seg && R.edge - R.seg.sh < r + 6) return;
   if (Math.hypot(x - spawn.x, y - spawn.y) < 250) return;
   for (const o of c.statics) if (Math.hypot(o.x - x, o.y - y) < o.r + r + 10) return;
   const roof = ROOFS[Math.floor(rng() * ROOFS.length)];
@@ -886,13 +1069,19 @@ const mapShown = document.createElement('canvas');
 mapShown.width = mapShown.height = MAP_N;
 let mapRow = 0, mapCX = 0, mapCY = 0, shownCX = 0, shownCY = 0, mapReady = false;
 
+let mapRoads = [];
+const MAP_ROAD_STYLE = { track: [1, '#7d6444'], lane: [1.5, '#d6d6cf'], road: [2, '#f4f4ef'], hw: [3.5, '#f2c14e'] };
+
 function mapWork(rows) {
-  if (mapRow === 0) { mapCX = car.x; mapCY = car.y; }
+  if (mapRow === 0) {
+    mapCX = car.x; mapCY = car.y;
+    mapRoads = segsNear(car.x - MAP_R - 300, car.y - MAP_R - 300, car.x + MAP_R + 300, car.y + MAP_R + 300);
+  }
   const d = mapBuf.data;
   for (let n = 0; n < rows && mapRow < MAP_N; n++, mapRow++) {
     const wy = mapCY - MAP_R + (mapRow + .5) * MAP_CELL;
     for (let i = 0; i < MAP_N; i++) {
-      const p = SURF[surfAtFast(mapCX - MAP_R + (i + .5) * MAP_CELL, wy)].rgb;
+      const p = SURF[surfaceAt(mapCX - MAP_R + (i + .5) * MAP_CELL, wy, NO_ROADS)].rgb;
       const o = (mapRow * MAP_N + i) * 4;
       d[o] = p[0]; d[o + 1] = p[1]; d[o + 2] = p[2]; d[o + 3] = 255;
     }
@@ -911,6 +1100,19 @@ function drawMap() {
     mctx.imageSmoothingEnabled = false;
     mctx.drawImage(mapShown, (shownCX - car.x) * k, (shownCY - car.y) * k, S, S);
   }
+  const k = S / (MAP_R * 2);
+  mctx.lineJoin = 'round'; mctx.lineCap = 'round';
+  for (const v of mapRoads) {
+    const s = v.seg, st = MAP_ROAD_STYLE[s.type];
+    mctx.lineWidth = st[0]; mctx.strokeStyle = st[1];
+    mctx.beginPath();
+    for (let q = v.i0; q <= v.i1; q += 3) {
+      const x = (s.xs[q] - car.x) * k + S / 2, y = (s.ys[q] - car.y) * k + S / 2;
+      q === v.i0 ? mctx.moveTo(x, y) : mctx.lineTo(x, y);
+    }
+    mctx.lineTo((s.xs[v.i1] - car.x) * k + S / 2, (s.ys[v.i1] - car.y) * k + S / 2);
+    mctx.stroke();
+  }
   mctx.save(); mctx.translate(S / 2, S / 2); mctx.rotate(car.a);
   mctx.fillStyle = CAR_COLORS[car.color]; mctx.strokeStyle = '#000'; mctx.lineWidth = 1.5;
   mctx.beginPath(); mctx.moveTo(8, 0); mctx.lineTo(-6, -5.5); mctx.lineTo(-3, 0); mctx.lineTo(-6, 5.5); mctx.closePath();
@@ -921,38 +1123,42 @@ function drawMap() {
 // ---------- HUD ----------
 const elSpd = document.getElementById('spd'), elGear = document.getElementById('gear');
 const elSurf = document.getElementById('surfName'), elSw = document.getElementById('swatch');
-let hudSurf = -1;
+let hudName = '';
 function updateHud() {
   elSpd.textContent = Math.round(Math.abs(car.vf) * KMH);
   elGear.textContent = car.vf < -5 ? 'R' : car.vf > 5 ? 'D' : 'N';
-  let s = surfAtFast(car.x, car.y);
-  if (s !== hudSurf) {
-    hudSurf = s;
-    const p = SURF[s];
-    elSurf.textContent = p.name;
-    elSw.style.background = `rgb(${p.rgb[0]},${p.rgb[1]},${p.rgb[2]})`;
+  if (frameNo % 8) return;
+  const s = surfAtFast(car.x, car.y);
+  const R = roadQuery(car.x, car.y, segsNear(car.x, car.y, car.x, car.y));
+  let name = SURF[s].name, col = SURF[s].rgb;
+  if (R.seg && R.edge < 0) {
+    name = RT[R.seg.type].name + (s === S_BRIDGE ? ' · Brücke' : '');
+    if (R.seg.type !== 'track') col = [86, 88, 94];
+  }
+  if (name !== hudName) {
+    hudName = name;
+    elSurf.textContent = name;
+    elSw.style.background = `rgb(${col[0]},${col[1]},${col[2]})`;
   }
 }
 
 // ---------- Welt ----------
+// Start auf dem rechten Fahrstreifen der nächstgelegenen Landstraße
 function findSpawn() {
-  for (let rad = 0; rad < 30000; rad += 40) {
-    const steps = Math.max(1, Math.floor(rad / 40) * 6);
-    for (let k = 0; k < steps; k++) {
-      const ang = k / steps * TAU, x = Math.cos(ang) * rad, y = Math.sin(ang) * rad;
-      if (surfaceAt(x, y) !== S_ASPHALT || lastRD > 8) continue;
-      // Richtung wählen, in der die Straße am längsten geradeaus weiterläuft
-      let best = 0, bestA = 0;
-      for (let deg = 0; deg < 360; deg += 5) {
-        const a = deg / 180 * Math.PI;
-        let n = 0;
-        for (let d = 20; d <= 200; d += 20) {
-          if (surfaceAt(x + Math.cos(a) * d, y + Math.sin(a) * d) !== S_ASPHALT) break;
-          n++;
-        }
-        if (n > best) { best = n; bestA = a; }
+  for (let r = 1500; r < 60000; r *= 1.6) {
+    let best = null, bd = Infinity;
+    for (const v of segsNear(-r, -r, r, r)) {
+      const s = v.seg;
+      if (s.type !== 'road') continue;
+      for (let k = Math.max(v.i0, 4); k <= Math.min(v.i1, s.n - 5); k++) {
+        if (s.water[k]) continue;
+        const d = s.xs[k] * s.xs[k] + s.ys[k] * s.ys[k];
+        if (d < bd) { bd = d; best = [s, k]; }
       }
-      return { x, y, a: bestA };
+    }
+    if (best) {
+      const [s, k] = best;
+      return { x: s.xs[k] + s.nx[k] * 11, y: s.ys[k] + s.ny[k] * 11, a: Math.atan2(-s.nx[k], s.ny[k]) };
     }
   }
   return { x: 0, y: 0, a: 0 };
@@ -963,6 +1169,7 @@ function newWorld(seed) {
   history.replaceState(null, '', '#' + seed);
   document.getElementById('seed').textContent = seed;
   chunks.clear();
+  segCache.clear();
   particles.length = 0;
   spawn = findSpawn();
   Object.assign(car, { x: spawn.x, y: spawn.y, a: spawn.a, vx: 0, vy: 0, w: 0, steer: 0, vf: 0, vl: 0 });
