@@ -147,6 +147,13 @@ const DENSE_F = 0.68;          // ab hier ist der Wald undurchdringlich
 
 // großräumige Seen plus kleinere Teiche
 function elev(x, y) { return 0.62 * fbm(x / 1800, y / 1800, SEED, 3) + 0.38 * fbm(x / 450, y / 450, SEED + 3, 3); }
+// Klima: großräumig und nur leicht verzerrt, damit Schnee und Wüste zusammenhängende Regionen
+// bilden statt kleiner Flecken; beide liegen an entgegengesetzten Enden der Skala und berühren sich nie
+const COLD_T = 0.34, HOT_T = 0.66;
+function climateT(x, y) {
+  const wx = x + 900 * (fbm(x / 2600, y / 2600, SEED + 33, 2) - .5), wy = y + 900 * (fbm(x / 2600, y / 2600, SEED + 34, 2) - .5);
+  return fbm(wx / 7000, wy / 7000, SEED + 31, 2);
+}
 function forestAt(x, y) { return fbm(x / 700, y / 700, SEED + 61, 2); }
 // Jede Oktave gedreht, sonst folgen die Grate dem achsparallelen Rauschgitter
 const ROT = [0, 0.9, 2.1, 3.3].map(a => [Math.cos(a), Math.sin(a)]);
@@ -301,11 +308,13 @@ const NETS = [
 const LANE = 36;
 const TRACK_VERGE = 18; // freier Randstreifen neben Waldwegen
 const RT = {
-  hw:    { half: 83, sh: 8, col: '#4b4d53', name: 'Autobahn', rank: 3 },    // 7.5 Mitte + 2 Streifen + 3.5 Rand
-  road:  { half: 40, sh: 6, col: '#5a5b61', name: 'Landstraße', rank: 2 },  // 1 Streifen je Richtung + 4 Rand
-  lane:  { half: 30, sh: 4, col: '#5a5b61', name: 'Nebenstraße', rank: 2 },
-  track: { half: 20, sh: 0, col: '#a08f70', name: 'Waldweg', rank: 1 },
-  street: { half: 30, sh: 8, col: '#55565c', name: 'Stadtstraße', rank: 2 },     // mit Gehweg statt Bankett
+  hw:    { half: 83, sh: 8, col: '#55575d', name: 'Autobahn', rank: 3 },    // 7.5 Mitte + 2 Streifen + 3.5 Rand
+  road:  { half: 40, sh: 6, col: '#55575d', name: 'Landstraße', rank: 2 },  // 1 Streifen je Richtung + 4 Rand
+  lane:  { half: 30, sh: 4, col: '#55575d', name: 'Nebenstraße', rank: 2 },
+  track: { half: 20, sh: 0, col: '#a08f70', name: 'Schotterstraße', rank: 1 },
+  street: { half: 30, sh: 8, col: '#55575d', name: 'Stadtstraße', rank: 2 },     // mit Gehweg statt Bankett
+  ramp:   { half: 18, sh: 4, col: '#55575d', name: 'Auf-/Abfahrt', rank: 2 },   // ein Fahrstreifen wie auf der Autobahn
+  ring:   { half: 17, sh: 4, col: '#55575d', name: 'Kreisverkehr', rank: 2 },
 };
 const segCache = new Map();
 const NO_ROADS = [];
@@ -317,7 +326,16 @@ function roadNode(net, i, j) {
 }
 function edgeExists(net, i, j, dir) {
   if (net === 0) return dir ? hash(i, 0, SEED + 301) < 0.4 : hash(0, j, SEED + 300) < 0.4;
-  return hash(i, j, SEED + 310 + net * 2 + dir) < (net === 1 ? 0.68 : 0.6);
+  if (hash(i, j, SEED + 310 + net * 2 + dir) >= (net === 1 ? 0.68 : 0.6)) return false;
+  // keine Straßenknoten im Wasser: Brücken verbinden nur Ufer, Kreuzungen liegen an Land
+  return !nodeWet(net, i, j) && !nodeWet(net, dir ? i : i + 1, dir ? j + 1 : j);
+}
+const wetCache = new Map();
+function nodeWet(net, i, j) {
+  const key = net + '|' + i + '|' + j;
+  let w = wetCache.get(key);
+  if (w === undefined) { const [x, y] = roadNode(net, i, j); w = elev(x, y) < WL + 0.012; wetCache.set(key, w); }
+  return w;
 }
 const WOODLAND = { [S_GRASS]: 1, [S_SNOW]: 1, [S_MUD]: 1, [S_DENSE]: 1 };
 function nodeDegree(net, i, j) {
@@ -378,6 +396,8 @@ function buildSeg(net, i, j, dir, key) {
   }
   // Waldwege nur durch Wald und nie durchs Wasser
   if (net === 2 && (wet > 0 || forest < n * 0.6)) return null;
+  if (net === 2 && nearHighway(xs, ys, n)) return null;             // Schotterwege enden vor der Autobahn
+  if (net !== 0 && alongRailOrWetCrossing(xs, ys, n)) return null;  // nicht neben Gleisen her, keine Kreuzung über Wasser
   let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9, plen = 0;
   for (let q = 0; q < n; q++) {
     if (q) plen += Math.hypot(xs[q] - xs[q - 1], ys[q] - ys[q - 1]);
@@ -393,7 +413,13 @@ function buildSeg(net, i, j, dir, key) {
   const type = net === 0 ? 'hw' : net === 1 ? (!deadEnd && marked ? 'road' : 'lane') : 'track';
   const rt = RT[type];
   const tun = net === 0 && mtn ? findTunnels(hs, n) : null;
-  return { key, net, i, j, dir, type, tunnel: tun && tun.flags, tunnels: tun ? tun.runs : [], rank: rt.rank, half: rt.half, sh: rt.sh, col: rt.col, xs, ys, nx, ny, water, n,
+  let skip = null;                                                  // Kreisverkehr an einem Endknoten
+  if (net === 1) for (const [ti, tj] of [[i, j], [i2, j2]]) {
+    const tw = townAt(ti, tj);
+    if (!tw || !ringOf(tw)) continue;
+    for (let q = 0; q < n; q++) if (Math.hypot(xs[q] - tw.x, ys[q] - tw.y) < RING_R - 2) (skip = skip || new Uint8Array(n))[q] = 1;
+  }
+  return { key, net, i, j, dir, type, skip, tunnel: tun && tun.flags, tunnels: tun ? tun.runs : [], rank: rt.rank, half: rt.half, sh: rt.sh, col: rt.col, xs, ys, nx, ny, water, n,
            step: plen / (n - 1), mtn,
            hasWater: wet > 0, minx, miny, maxx, maxy };
 }
@@ -423,6 +449,184 @@ function findTunnels(hs, n) {
   return out.length ? { flags, runs: out } : null;
 }
 
+// Straße verläuft auf längerer Strecke dicht neben einem Gleis, oder kreuzt Autobahn bzw. Gleis
+// genau über dem Wasser (dort gäbe es eine Kreuzung auf einer Brücke)
+function alongRailOrWetCrossing(xs, ys, n) {
+  let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
+  for (let q = 0; q < n; q++) { minx = Math.min(minx, xs[q]); maxx = Math.max(maxx, xs[q]); miny = Math.min(miny, ys[q]); maxy = Math.max(maxy, ys[q]); }
+  const me = { xs, ys, n, minx, miny, maxx, maxy };
+  const rails = railsNear(minx, miny, maxx, maxy);
+  if (rails.length) {
+    let near = 0;
+    for (let q = 0; q < n; q++) if (railQuery(xs[q], ys[q], rails).edge < 60) near++;
+    if (near > n * 0.25) return true;
+  }
+  const C = NETS[0].cell, others = rails.map(v => v.seg);
+  for (let j = Math.floor(miny / C) - 1; j <= Math.floor(maxy / C) + 1; j++)
+    for (let i = Math.floor(minx / C) - 1; i <= Math.floor(maxx / C) + 1; i++)
+      for (let d = 0; d < 2; d++) { const h = getSeg(0, i, j, d); if (h) others.push(h); }
+  for (const o of others) for (const p of polyCross(me, o)) if (elev(p.x, p.y) < WL + 0.01) return true;
+  return false;
+}
+function nearHighway(xs, ys, n) {
+  let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
+  for (let q = 0; q < n; q++) { minx = Math.min(minx, xs[q]); maxx = Math.max(maxx, xs[q]); miny = Math.min(miny, ys[q]); maxy = Math.max(maxy, ys[q]); }
+  const C = NETS[0].cell, views = [];
+  for (let j = Math.floor(miny / C) - 2; j <= Math.floor(maxy / C) + 1; j++)
+    for (let i = Math.floor(minx / C) - 2; i <= Math.floor(maxx / C) + 1; i++)
+      for (let d = 0; d < 2; d++) { const h = getSeg(0, i, j, d); if (h) views.push({ seg: h, i0: 0, i1: h.n - 1 }); }
+  if (!views.length) return false;
+  for (let q = 0; q < n; q += 2) { const R = roadQuery(xs[q], ys[q], views); if (R.seg && R.edge < R.seg.sh + 25) return true; }
+  return false;
+}
+
+// ---------- Anschlussstellen ----------
+// Die Autobahn hat durchgehend Leitplanken; hinauf und hinunter geht es nur über Anschlussstellen.
+// Jede ist eine Raute aus vier Rampen am Boden: in jeder Fahrtrichtung kommt vor der Brücke die
+// Abfahrt, dahinter die Auffahrt.
+const rampCache = new Map();
+function rampsFor(h, r) {
+  const key = h.key + '#' + r.key;
+  let out = rampCache.get(key);
+  if (out) return out;
+  out = [];
+  for (const p of polyCross(h, r)) {
+    const c = ixCandidate(h, r, p);
+    if (c && ixChosen(h, c)) out.push(...c.ramps);
+  }
+  rampCache.set(key, out);
+  return out;
+}
+// Mögliche Anschlussstelle an einer Kreuzung: außerorts an Landstraßen immer, an Nebenstraßen jede
+// zweite, in der Großstadt an steilen Querungen; nur wenn alle vier Rampen Platz finden
+const IX_DIST = 1700, ixCache = new Map();
+function ixCandidate(h, r, p) {
+  const key = h.key + '#' + r.key + '#' + Math.round(p.x) + '|' + Math.round(p.y);
+  if (ixCache.has(key)) return ixCache.get(key);
+  let c = null;
+  const S = setlQuery(p.x, p.y, settlementsNear(p.x, p.y, p.x, p.y)), city = r.net === 3 ? S.s : null;
+  const hv = hash(Math.round(p.x / 64), Math.round(p.y / 64), SEED + 710);
+  const ok = !(h.tunnel && h.tunnel[p.ia]) && Math.hypot(p.x - h.xs[h.n - 1], p.y - h.ys[h.n - 1]) >= 2 &&   // am Knoten zählt der Nachfolger
+             (city ? S.f <= 0.9 : S.f >= 1.3 && (r.type !== 'lane' || hv <= 0.5));
+  if (ok) { const ramps = makeRamps(h, r, p, city); if (ramps) c = { x: p.x, y: p.y, hv, ramps }; }
+  ixCache.set(key, c);
+  return c;
+}
+// Gebaut wird eine Anschlussstelle nur, wenn im Umkreis an derselben Autobahn keine mit höherem
+// Rang liegt – so überschneiden sich die Rampen benachbarter Anschlüsse nie
+function ixChosen(h, c) {
+  if (c.chosen !== undefined) return c.chosen;
+  const D = IX_DIST, x0 = c.x - D, y0 = c.y - D, x1 = c.x + D, y1 = c.y + D, roads = [];
+  const C1 = NETS[1].cell;
+  for (let j = Math.floor(y0 / C1) - 1; j <= Math.floor(y1 / C1); j++)
+    for (let i = Math.floor(x0 / C1) - 1; i <= Math.floor(x1 / C1); i++)
+      for (let d = 0; d < 2; d++) { const r = getSeg(1, i, j, d); if (r) roads.push(r); }
+  for (const st of settlementsNear(x0, y0, x1, y1)) if (st.kind === 'city')
+    for (const r of streetsOf(st)) if (r.skind === 'city' || r.skind === 'avenue') roads.push(r);
+  const hs = [h, getSeg(0, h.dir ? h.i : h.i - 1, h.dir ? h.j - 1 : h.j, h.dir), getSeg(0, h.dir ? h.i : h.i + 1, h.dir ? h.j + 1 : h.j, h.dir)];
+  c.chosen = true;
+  for (const g of hs) if (g) for (const r of roads) for (const p of polyCross(g, r)) {
+    if (Math.hypot(p.x - c.x, p.y - c.y) >= D) continue;
+    const o = ixCandidate(g, r, p);
+    if (o && o !== c && (o.hv < c.hv || (o.hv === c.hv && o.x < c.x))) { c.chosen = false; return false; }
+  }
+  return true;
+}
+// Rampe: zuerst ein Verzögerungs-/Beschleunigungsstreifen bündig neben dem äußeren Autobahnstreifen
+// (mit kurzer Verziehung), dann schwenkt sie ab und mündet hinter der Brücke bündig in die Straße.
+// Quadrant (sh, sv): sh = Seite der Kreuzung entlang der Autobahn, sv = Fahrbahnseite. Rechts der
+// Stützpunktrichtung (sv = 1) fährt man in Richtung steigender Indizes, also ist sh = -1 dort die
+// Abfahrt (vor der Brücke) und sh = 1 die Auffahrt (dahinter); links umgekehrt.
+const RAMP_TAPER = 70, RAMP_PARALLEL = 160;
+// Autobahnsegment samt Vorgänger und Nachfolger als eine Polylinie: Anschlussstellen in der
+// Großstadt liegen nahe am Knoten, ihre Rampen reichen ins Nachbarsegment
+function hwChain(h) {
+  if (h.chain) return h.chain;
+  const prev = getSeg(0, h.dir ? h.i : h.i - 1, h.dir ? h.j - 1 : h.j, h.dir);
+  const next = getSeg(0, h.dir ? h.i : h.i + 1, h.dir ? h.j + 1 : h.j, h.dir);
+  const xs = [], ys = [], nx = [], ny = [], tunnel = [];
+  const add = (s, a, b) => { for (let k = a; k < b; k++) { xs.push(s.xs[k]); ys.push(s.ys[k]); nx.push(s.nx[k]); ny.push(s.ny[k]); tunnel.push(s.tunnel ? s.tunnel[k] : 0); } };
+  if (prev) add(prev, 0, prev.n - 1);
+  const off = xs.length;
+  add(h, 0, h.n);
+  if (next) add(next, 1, next.n);
+  let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
+  for (let q = 0; q < xs.length; q++) { minx = Math.min(minx, xs[q]); maxx = Math.max(maxx, xs[q]); miny = Math.min(miny, ys[q]); maxy = Math.max(maxy, ys[q]); }
+  return h.chain = { key: h.key, half: h.half, sh: h.sh, step: h.step, off, n: xs.length, xs, ys, nx, ny, tunnel, minx, miny, maxx, maxy };
+}
+function makeRamps(h0, r, p0, city) {
+  const h = hwChain(h0), p = { x: p0.x, y: p0.y, ia: p0.ia + h.off, ib: p0.ib };
+  const th = [h.ny[p.ia], -h.nx[p.ia]], nh = [h.nx[p.ia], h.ny[p.ia]];
+  const tr = [r.ny[p.ib], -r.nx[p.ib]], nr = [r.nx[p.ib], r.ny[p.ib]];
+  const sin = Math.abs(th[0] * tr[1] - th[1] * tr[0]);
+  if (sin < (city ? 0.6 : 0.45)) return null;                        // zu flacher Winkel: kein Anschluss
+  const span = (h.half + h.sh + UNDERPASS_CLEAR) / sin + 24;          // halbe Brückenlänge der Straße
+  const R = Math.max(span + 80, (r.half + r.sh + 30) / sin);
+  const L1 = R + 120 + RAMP_TAPER + RAMP_PARALLEL;                  // Beginn der Verziehung, vom Kreuzungspunkt
+  const laneOff = 7.5 + 2 * LANE + RT.ramp.half;                    // bündig neben dem äußeren Streifen
+  const out = [];
+  for (const sh of [-1, 1]) for (const sv of [-1, 1]) {
+    const sr = Math.sign(tr[0] * nh[0] + tr[1] * nh[1]) * sv || sv;  // Straßenseite auf derselben Seite der Autobahn
+    const sq = Math.sign(nr[0] * th[0] * sh + nr[1] * th[1] * sh) || 1;
+    const xs = [], ys = [];
+    // Teil A entlang der Autobahn-Polylinie (folgt ihren Kurven)
+    let ok = true, endK = 0;
+    for (let d = L1; d >= L1 - RAMP_TAPER - RAMP_PARALLEL; d -= 14) {
+      const q = p.ia + sh * Math.round(d / h.step);
+      if (q < 0 || q >= h.n || h.tunnel[q]) { ok = false; break; }    // nicht neben einem Tunnel
+      const f = clamp((L1 - d) / RAMP_TAPER, 0, 1), off = laneOff - (1 - f * f * (3 - 2 * f)) * 30;
+      xs.push(h.xs[q] + h.nx[q] * sv * off); ys.push(h.ys[q] + h.ny[q] * sv * off); endK = q;
+    }
+    if (!ok) return null;
+    const nA = xs.length;
+    // Teil B: Abzweig zur Straße
+    const A = [xs[nA - 1], ys[nA - 1]], tA = [h.ny[endK] * -sh, -h.nx[endK] * -sh];
+    const Rp = [p.x + tr[0] * sr * (R + 50), p.y + tr[1] * sr * (R + 50)];
+    const P3 = [Rp[0] + nr[0] * sq * (r.half - 4), Rp[1] + nr[1] * sq * (r.half - 4)];
+    const P2 = [P3[0] + nr[0] * sq * R * 0.5, P3[1] + nr[1] * sq * R * 0.5];
+    const dist = Math.hypot(P3[0] - A[0], P3[1] - A[1]);
+    const P1 = [A[0] + tA[0] * dist * 0.45, A[1] + tA[1] * dist * 0.45];
+    const nB = Math.ceil(dist * 1.3 / 14) + 1;
+    for (let q = 1; q < nB; q++) {
+      const t = q / (nB - 1), u = 1 - t, b0 = u * u * u, b1 = 3 * u * u * t, b2 = 3 * u * t * t, b3 = t * t * t;
+      xs.push(b0 * A[0] + b1 * P1[0] + b2 * P2[0] + b3 * P3[0]); ys.push(b0 * A[1] + b1 * P1[1] + b2 * P2[1] + b3 * P3[1]);
+    }
+    const n = xs.length;
+    if (xs.some((x, q) => q % 2 === 0 && isWater(x, ys[q]))) return null; // nicht übers Wasser
+    const rails = railsNear(Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys));
+    if (rails.length && xs.some((x, q) => railQuery(x, ys[q], rails).edge < RT.ramp.half + 12)) return null;   // nicht übers Gleis
+    if (city && crossesOther(xs, ys, city, r, h)) return null;          // keine fremde Stadtstraße kreuzen
+    const seg = rampSeg(h.key + '>' + r.key + '|' + Math.round(p.x) + '|' + sh + '|' + sv, xs, ys);
+    seg.hwRef = h; seg.roadRef = r; seg.exit = sh === -sv;           // Abfahrt: Fahrtrichtung = Stützpunktrichtung
+    out.push(seg);
+  }
+  return out;                                                        // nur vollständige Rauten
+}
+// neben der Autobahn läuft die Rampe unter den Brücken der Querstraßen durch, sonst darf sie keine kreuzen
+function crossesOther(xs, ys, city, r, h) {
+  const views = streetsOf(city).filter(s => s !== r).map(s => ({ seg: s, i0: 0, i1: s.n - 1 })), hv = [{ seg: h, i0: 0, i1: h.n - 1 }];
+  for (let q = 2; q < xs.length - 3; q += 2) {
+    if (segNearest(hv, xs[q], ys[q]).d < h.half + 42) continue;
+    const R = roadQuery(xs[q], ys[q], views); if (R.seg && R.edge < 6) return true;
+  }
+  return false;
+}
+function rampSeg(key, xs, ys) {
+  const n = xs.length, X = Float32Array.from(xs), Y = Float32Array.from(ys);
+  const nx = new Float32Array(n), ny = new Float32Array(n);
+  let len = 0, minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
+  for (let q = 0; q < n; q++) {
+    const a = Math.max(0, q - 1), b = Math.min(n - 1, q + 1), tx = X[b] - X[a], ty = Y[b] - Y[a], l = Math.hypot(tx, ty) || 1;
+    nx[q] = -ty / l; ny[q] = tx / l;
+    if (q) len += Math.hypot(X[q] - X[q - 1], Y[q] - Y[q - 1]);
+    minx = Math.min(minx, X[q]); maxx = Math.max(maxx, X[q]); miny = Math.min(miny, Y[q]); maxy = Math.max(maxy, Y[q]);
+  }
+  const rt = RT.ramp;
+  return { key, net: 4, i: 0, j: 0, dir: 9, type: 'ramp', rank: rt.rank, half: rt.half, sh: rt.sh, col: rt.col,
+           xs: X, ys: Y, nx, ny, water: new Uint8Array(n), n, step: len / (n - 1), mtn: false, tunnel: null, tunnels: [],
+           hasWater: false, minx, miny, maxx, maxy };
+}
+
 // Alle Segmente nahe eines Rechtecks, jeweils auf den relevanten Stützpunktbereich beschnitten
 function segsNear(x0, y0, x1, y1) {
   const out = [];
@@ -436,18 +640,27 @@ function segsNear(x0, y0, x1, y1) {
     }
     if (i0 >= 0) out.push({ seg: s, i0: Math.max(0, i0 - 1), i1: Math.min(s.n - 1, i1 + 1) });
   };
+  const hws = [], roads = [], M = 500;
+  const near = (s, m = M) => !(s.maxx < x0 - m || s.minx > x1 + m || s.maxy < y0 - m || s.miny > y1 + m);
   for (let net = 0; net < 3; net++) {
     const cell = NETS[net].cell;
     for (let j = Math.floor(y0 / cell) - 2; j <= Math.floor(y1 / cell) + 1; j++) {
       for (let i = Math.floor(x0 / cell) - 2; i <= Math.floor(x1 / cell) + 1; i++) {
         for (let dir = 0; dir < 2; dir++) {
           const s = getSeg(net, i, j, dir);
-          if (s) push(s);
+          if (!s) continue;
+          push(s);
+          if (net === 0 && near(s, 1100)) hws.push(s);              // Rampen reichen ins Nachbarsegment
+          else if (net === 1 && near(s, 1100)) roads.push(s);
         }
       }
     }
   }
-  for (const st of settlementsNear(x0, y0, x1, y1)) for (const s of streetsOf(st)) push(s);
+  for (const st of settlementsNear(x0 - 600, y0 - 600, x1 + 600, y1 + 600)) for (const s of ringOf(st) ? [st.ring, ...streetsOf(st)] : streetsOf(st)) {
+    push(s);
+    if (st.kind === 'city' && (s.skind === 'city' || s.skind === 'avenue') && near(s, 1100)) roads.push(s);
+  }
+  for (const h of hws) for (const r of roads) for (const s of rampsFor(h, r)) push(s);   // Auf- und Abfahrten
   out.sort((a, b) => b.seg.net - a.seg.net || (a.seg.key < b.seg.key ? -1 : a.seg.key > b.seg.key ? 1 : 0));
   return out;
 }
@@ -489,19 +702,16 @@ function crossingsOf(a, b) {
 const allCrossings = [];
 function makeCrossing(a, b, i, j, x, y) {
   const sin = Math.max(0.4, Math.abs(a.ny[i] * -b.nx[j] - -a.nx[i] * b.ny[j]));
-  // a ist immer die Autobahn; Waldwege liegen nie auf einer Brücke
-  // im Tunnel liegt die Autobahn immer unten
-  const aUp = !(a.tunnel && a.tunnel[i]) &&                 // in Städten verläuft sie aufgeständert
-              (b.type === 'track' || b.net === 3 || hash(Math.floor(x / 64), Math.floor(y / 64), SEED + 700) < 0.5);
-  const up = aUp ? a : b, lo = aUp ? b : a;
+  // a ist immer die Autobahn: sie liegt überall unten, die andere Straße führt auf einer Brücke darüber
+  const up = b, lo = a;
   const span = (lo.half + lo.sh + UNDERPASS_CLEAR) / sin + 24;     // halbe Brückenlänge
   const R = Math.max(span + 80, (up.half + up.sh + 30) / sin);
   return { x, y, up, lo, span, R, upV: chainViews(up, x, y, R * 1.6), loV: chainViews(lo, x, y, R * 1.6) };
 }
 // Das Segment samt Vorgänger und Nachfolger derselben Straße, beschnitten auf den Umkreis rad
 function chainViews(s, x, y, rad) {
-  const prev = s.net === 3 ? null : getSeg(s.net, s.dir ? s.i : s.i - 1, s.dir ? s.j - 1 : s.j, s.dir);
-  const next = s.net === 3 ? null : getSeg(s.net, s.dir ? s.i : s.i + 1, s.dir ? s.j + 1 : s.j, s.dir);
+  const prev = s.net >= 3 ? null : getSeg(s.net, s.dir ? s.i : s.i - 1, s.dir ? s.j - 1 : s.j, s.dir);
+  const next = s.net >= 3 ? null : getSeg(s.net, s.dir ? s.i : s.i + 1, s.dir ? s.j + 1 : s.j, s.dir);
   const out = [];
   for (const q of [prev, s, next]) {
     if (!q) continue;
@@ -534,10 +744,11 @@ function roadQuery(x, y, views) {
   for (const v of views) {
     const s = v.seg, m = s.half + s.sh + 32; // deckt auch den Randstreifen der Waldwege ab
     if (x < s.minx - m || x > s.maxx + m || y < s.miny - m || y > s.maxy + m) continue;
-    const xs = s.xs, ys = s.ys;
+    const xs = s.xs, ys = s.ys, sk = s.skip;
     for (let k = v.i0; k < v.i1; k++) {
       const ax = xs[k], ay = ys[k];
       if (Math.abs(x - ax) > m || Math.abs(y - ay) > m) continue;
+      if (sk && (sk[k] || sk[k + 1])) continue;                      // Teil im Kreisverkehr entfällt
       const bx = xs[k + 1] - ax, by = ys[k + 1] - ay, px = x - ax, py = y - ay;
       const t = clamp((px * bx + py * by) / (bx * bx + by * by), 0, 1);
       const d = Math.hypot(px - bx * t, py - by * t) - s.half;
@@ -549,54 +760,39 @@ function roadQuery(x, y, views) {
 }
 
 // ---------- Eisenbahn ----------
-// Eigenes grobes Raster: wo eine Gitterzeile oder -spalte Gleise hat, laufen sie durchgehend
-// durch die ganze Welt. So können Züge eine Strecke ohne Ende befahren.
-const RAIL = { cell: 5200, jit: 0.18 }, RAIL_HALF = 11, RAIL_GAUGE = 4.5;
+// Bahnstrecken begleiten die Autobahnen: auf einem Teil der Autobahnzeilen und -spalten läuft
+// ein Gleis in festem Abstand parallel nebenher (weit genug für die Rampen der Anschlussstellen).
+// Da die Autobahnen die ganze Welt durchziehen, können Züge endlos fahren. Gleisabschnitte
+// tragen dieselben Indizes wie das Autobahnsegment, dem sie folgen.
+const RAIL_HALF = 11, RAIL_GAUGE = 4.5, RAIL_OFF = 430;
+const RAIL_CLEAR = 30; // baumfreier Streifen neben dem Gleisbett
 const railCache = new Map();
-function railNode(i, j) {
-  return [(i + .5 + (hash(i, j, SEED + 801) - .5) * 2 * RAIL.jit) * RAIL.cell,
-          (j + .5 + (hash(i, j, SEED + 802) - .5) * 2 * RAIL.jit) * RAIL.cell];
-}
-const railRow = j => hash(0, j, SEED + 803) < 0.35, railCol = i => hash(i, 0, SEED + 804) < 0.35;
-function railTangent(i, j, dir) {
-  const a = railNode(dir ? i : i - 1, dir ? j - 1 : j), b = railNode(dir ? i : i + 1, dir ? j + 1 : j);
-  const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy);
-  return [dx / l, dy / l];
-}
+const railLine = (line, dir) => hash(line, dir, SEED + 803) < 0.6;
 function railSeg(i, j, dir) {
   const key = i + '|' + j + '|' + dir;
   let s = railCache.get(key);
   if (s !== undefined) return s;
   s = null;
-  if (dir ? railCol(i) : railRow(j)) {
-    const i2 = dir ? i : i + 1, j2 = dir ? j + 1 : j;
-    const A = railNode(i, j), B = railNode(i2, j2), tA = railTangent(i, j, dir), tB = railTangent(i2, j2, dir);
-    const len = Math.hypot(B[0] - A[0], B[1] - A[1]), k = len * 0.36;
-    const P1 = [A[0] + tA[0] * k, A[1] + tA[1] * k], P2 = [B[0] - tB[0] * k, B[1] - tB[1] * k];
-    const n = Math.ceil(len / 14) + 1;
+  const h = railLine(dir ? i : j, dir) ? getSeg(0, i, j, dir) : null;
+  if (h) {
+    const side = hash(dir ? i : j, dir, SEED + 805) < 0.5 ? -1 : 1, n = h.n;
     const xs = new Float32Array(n), ys = new Float32Array(n), nx = new Float32Array(n), ny = new Float32Array(n);
     const cum = new Float32Array(n), water = new Uint8Array(n);
     let minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9, wet = 0;
     for (let q = 0; q < n; q++) {
-      const t = q / (n - 1), u = 1 - t, b0 = u * u * u, b1 = 3 * u * u * t, b2 = 3 * u * t * t, b3 = t * t * t;
-      xs[q] = b0 * A[0] + b1 * P1[0] + b2 * P2[0] + b3 * B[0];
-      ys[q] = b0 * A[1] + b1 * P1[1] + b2 * P2[1] + b3 * B[1];
+      xs[q] = h.xs[q] + h.nx[q] * side * RAIL_OFF; ys[q] = h.ys[q] + h.ny[q] * side * RAIL_OFF;
       if (q) cum[q] = cum[q - 1] + Math.hypot(xs[q] - xs[q - 1], ys[q] - ys[q - 1]);
       if (isWater(xs[q], ys[q])) { water[q] = 1; wet++; }
       minx = Math.min(minx, xs[q]); maxx = Math.max(maxx, xs[q]); miny = Math.min(miny, ys[q]); maxy = Math.max(maxy, ys[q]);
     }
-    for (let q = 0; q < n; q++) {
-      const a = Math.max(0, q - 1), b = Math.min(n - 1, q + 1);
-      const tx = xs[b] - xs[a], ty = ys[b] - ys[a], l = Math.hypot(tx, ty) || 1;
-      nx[q] = -ty / l; ny[q] = tx / l;
-    }
+    for (let q = 0; q < n; q++) { nx[q] = h.nx[q]; ny[q] = h.ny[q]; }
     s = { key, i, j, dir, xs, ys, nx, ny, cum, len: cum[n - 1], water, hasWater: wet > 0, n, minx, miny, maxx, maxy, half: RAIL_HALF };
   }
   railCache.set(key, s);
   return s;
 }
 function railsNear(x0, y0, x1, y1) {
-  const out = [], C = RAIL.cell, m = RAIL_HALF + 60;
+  const out = [], C = NETS[0].cell, m = RAIL_HALF + 60;
   for (let j = Math.floor(y0 / C) - 2; j <= Math.floor(y1 / C) + 1; j++)
     for (let i = Math.floor(x0 / C) - 2; i <= Math.floor(x1 / C) + 1; i++)
       for (let dir = 0; dir < 2; dir++) {
@@ -654,10 +850,10 @@ function surfaceAt(x, y, views, setl, rivs, rails) {
   const list = setl || settlementsNear(x, y, x, y);
   const e = elev(x, y), h = mtnH(x, y, list);
   const S = setlQuery(x, y, list), town = S.s, sf = town ? S.f : 99;
-  const t = fbm(x / 2400, y / 2400, SEED + 31, 3);
+  const t = climateT(x, y);
   const Rv = riverQuery(x, y, rivs || riversNear(x, y, x, y)), river = Rv.edge < 0, rivEdge = Rv.edge, rivHw = Rv.hw;
   const deepRiver = river && rivHw > 11 && Rv.dist < rivHw * 0.6;
-  const cold = t < 0.39, water = (e < WL && h < 0.2 && sf >= 1.3) || river;
+  const cold = t < COLD_T, water = (e < WL && h < 0.2 && sf >= 1.3) || river;
   const R = roadQuery(x, y, views || segsNear(x, y, x, y));
   lastE = e; lastH = h; lastCold = cold;
   let verge = false;
@@ -669,22 +865,25 @@ function surfaceAt(x, y, views, setl, rivs, rails) {
   const Rr = railQuery(x, y, rails || railsNear(x, y, x, y));          // Gleise: Bett, über Wasser Brücke
   if (Rr.seg && Rr.edge < 0) return water ? S_BRIDGE : S_RAIL;
   if (Rr.seg && Rr.edge < 6 && !water) return S_GRAVEL;
+  if (Rr.seg && Rr.edge < RAIL_CLEAR) verge = true;                   // neben den Gleisen bleibt ein Streifen frei
+  if (town && ringOf(town) && Math.hypot(x - town.x, y - town.y) < RING_R - RT.ring.half - 2) return cold ? S_SNOW : S_GRASS; // Mittelinsel
   if (river) {                                                      // Flusswasser: Tiefe für die Färbung
     lastE = deepRiver ? WD - 0.06 * (1 - Rv.dist / (rivHw * 0.6)) : WD + (WL - WD) * clamp(Rv.dist / rivHw, 0, 1);
     return cold ? S_ICE : deepRiver ? S_DEEP : S_SHALLOW;
   }
   if (water) return cold ? S_ICE : (e < WD ? S_DEEP : S_SHALLOW);
-  if (rivEdge < 6 && rivHw > 9 && sf >= 1) return cold ? S_SNOW : S_SAND;   // Uferstreifen
+  if (rivEdge < 6 && rivHw > 9 && sf >= 1 && t > HOT_T) return S_SAND;      // Sandufer nur in der Wüste
   if (sf < 1 + 0.16 * (vnoise(x / 70, y / 70, SEED + 77) - 0.5)) return urbanGround(town, x, y, cold);
   if (h > 0.6) return S_CLIFF;
   if (h > 0.35) return S_ROCK;
-  if (e < WL + 0.025 && h < 0.2 && sf >= 1.3) return cold ? S_SNOW : S_SAND;
+  // Strände: in der Wüste breit, sonst nur ein schmaler Saum (keine Sandflecken außerhalb der Wüste)
+  if (e < WL + (t > HOT_T ? 0.025 : 0.008) && h < 0.2 && sf >= 1.3) return cold ? S_SNOW : S_SAND;
   const m = fbm(x / 800, y / 800, SEED + 47, 3);
   const f = forestAt(x, y);
   lastM = m;
   // am Waldweg weicht der dichte Wald einem befahrbaren Randstreifen
   if (cold) return f > DENSE_F && !verge ? S_DENSE : m > 0.68 ? S_ICE : S_SNOW;
-  if (t > 0.62) return m > 0.66 ? S_GRASS : S_SAND;
+  if (t > HOT_T) return m > 0.76 ? S_GRASS : S_SAND;                  // Wüste, selten eine Oase
   if (m < 0.68 && f < 0.56 && farmAt(x, y)) {
     const P = parcelAt(x, y);
     lastPW = P.w;
@@ -740,7 +939,7 @@ function cityAt(i, j) {
   if (s !== undefined) return s;
   s = null;
   const row = hash(0, j, SEED + 300) < 0.4, col = hash(i, 0, SEED + 301) < 0.4; // wie edgeExists der Autobahnen
-  if ((row && col) || ((row || col) && hash(i, j, SEED + 400) < 0.35)) {
+  if (row !== col && hash(i, j, SEED + 400) < 0.55) {               // genau eine Autobahn führt hindurch
     const [x, y] = roadNode(0, i, j);
     s = makeSettlement('city', key, i, j, x, y, 800 + 500 * hash(i, j, SEED + 401));
   }
@@ -839,9 +1038,84 @@ function cityGrid(s) {
                                s.x + Math.cos(a) * L, s.y + Math.sin(a) * L, 2, 100 + q, 'avenue'));
   }
 }
+// Die Autobahn liegt am Boden: Ortsstraßen queren sie nur steil auf Brücken, alles was neben
+// oder schräg über ihr läge, endet vorher (in der Großstadt mit Platz für die Rampen)
+const HW_CLEAR = 330, HW_CLEAR_SMALL = 150, BRIDGE_GAP = 450;
+function trimAtHighway(s) {
+  const C = NETS[0].cell, i0 = Math.floor((s.x - s.R) / C) - 1, j0 = Math.floor((s.y - s.R) / C) - 1, hws = [];
+  for (let j = j0; j <= Math.floor((s.y + s.R) / C) + 1; j++)
+    for (let i = i0; i <= Math.floor((s.x + s.R) / C) + 1; i++)
+      for (let d = 0; d < 2; d++) { const h = getSeg(0, i, j, d); if (h) hws.push(h); }
+  if (!hws.length) return;
+  const clear = s.kind === 'city' ? HW_CLEAR : HW_CLEAR_SMALL;
+  const views = hws.map(h => ({ seg: h, i0: 0, i1: h.n - 1 })), out = [], cross = [], ok = [];
+  const C1 = NETS[1].cell, m = s.R + 600;                          // Brücken der Landstraßen stehen schon
+  for (let j = Math.floor((s.y - m) / C1) - 1; j <= Math.floor((s.y + m) / C1); j++)
+    for (let i = Math.floor((s.x - m) / C1) - 1; i <= Math.floor((s.x + m) / C1); i++)
+      for (let d = 0; d < 2; d++) { const r = getSeg(1, i, j, d); if (r) for (const h of hws) for (const p of polyCross(r, h)) ok.push({ st: r, x: p.x, y: p.y }); }
+  for (const st of s.streets) for (const h of hws) for (const p of polyCross(st, h)) {   // steile Querungen: Brücke
+    const sin = Math.abs(h.nx[p.ib] * st.ny[p.ia] - h.ny[p.ib] * st.nx[p.ia]);
+    if (sin >= 0.6 && !(h.tunnel && h.tunnel[p.ib])) cross.push({ st, x: p.x, y: p.y, r: clear / sin + 30 });
+  }
+  // Brücken mit Abstand, damit sich keine zwei Straßen auf oder neben einer Brücke kreuzen
+  cross.sort((a, b) => (a.st.skind === 'avenue') - (b.st.skind === 'avenue') || (a.st.key < b.st.key ? -1 : 1));
+  for (const c of cross) if (!ok.some(o => Math.hypot(o.x - c.x, o.y - c.y) < BRIDGE_GAP)) ok.push(c);
+  // Gleise: Ortsstraßen queren sie steil (Bahnübergang), laufen aber nicht neben oder auf ihnen
+  const rails = railsNear(s.x - s.R, s.y - s.R, s.x + s.R, s.y + s.R);
+  for (const st of s.streets) {
+    const good = ok.filter(c => c.st === st).map(c => [c.x, c.y, c.r]), rgood = [];
+    // in der Großstadt nur die Brückenstraßen über die Autobahn, die übrigen enden vor dem Gleis
+    if (s.kind !== 'city' || good.length) for (const v of rails) for (const p of polyCross(st, v.seg)) {
+      const sin = Math.abs(v.seg.nx[p.ib] * st.ny[p.ia] - v.seg.ny[p.ib] * st.nx[p.ia]);
+      if (sin >= 0.5) rgood.push([p.x, p.y, 60 / sin + 20]);
+    }
+    const near = (L, q) => L.some(([x, y, r]) => Math.hypot(st.xs[q] - x, st.ys[q] - y) < r);
+    const bad = q => (segNearest(views, st.xs[q], st.ys[q]).d < clear && !near(good, q)) ||
+                     (rails.length && railQuery(st.xs[q], st.ys[q], rails).edge < 45 && !near(rgood, q));
+    let a = -1, part = 0;
+    for (let q = 0; q <= st.n; q++) {
+      if (q < st.n && !bad(q)) { if (a < 0) a = q; continue; }
+      if (a >= 0 && q - a > 4) {
+        if (a === 0 && q === st.n) out.push(st);
+        else out.push(polySeg(st.key + '~' + part++, Array.from(st.xs.slice(a, q)), Array.from(st.ys.slice(a, q)), st.dir, st.dir ? st.i : st.j, st.skind));
+      }
+      a = -1;
+    }
+  }
+  s.streets = out;
+}
 
+// Kreisverkehr: geschlossener Ring, Stützpunkte gegen den Uhrzeigersinn (Fahrtrichtung)
+const RING_R = 62;
+function ringSeg(key, cx, cy) {
+  const n = 41, xs = new Float32Array(n), ys = new Float32Array(n), nx = new Float32Array(n), ny = new Float32Array(n);
+  for (let q = 0; q < n; q++) { const a = -q / (n - 1) * TAU; xs[q] = cx + Math.cos(a) * RING_R; ys[q] = cy + Math.sin(a) * RING_R; }
+  for (let q = 0; q < n; q++) {
+    const a = q === 0 ? n - 2 : q - 1, b = q === n - 1 ? 1 : q + 1, tx = xs[b] - xs[a], ty = ys[b] - ys[a], l = Math.hypot(tx, ty);
+    nx[q] = -ty / l; ny[q] = tx / l;
+  }
+  const rt = RT.ring, inner = Math.sign((cx - xs[0]) * nx[0] + (cy - ys[0]) * ny[0]);
+  return { key, net: 5, i: 0, j: 0, dir: 7, type: 'ring', rank: rt.rank, half: rt.half, sh: rt.sh, col: rt.col,
+           xs, ys, nx, ny, water: new Uint8Array(n), n, step: TAU * RING_R / (n - 1), mtn: false, tunnel: null, tunnels: [],
+           hasWater: false, inner, cx, cy, minx: cx - RING_R, maxx: cx + RING_R, miny: cy - RING_R, maxy: cy + RING_R };
+}
+
+// Kreisverkehr in der Kleinstadt, aber nicht direkt an der Autobahn (erst bei Bedarf bestimmt:
+// die Autobahn hängt ihrerseits von den Orten ab)
+function ringOf(s) {
+  if (s.ring !== undefined) return s.ring;
+  s.ring = null;
+  if (s.kind !== 'town') return null;
+  const C = NETS[0].cell, views = [];
+  for (let j = Math.floor(s.y / C) - 1; j <= Math.floor(s.y / C) + 1; j++)
+    for (let i = Math.floor(s.x / C) - 1; i <= Math.floor(s.x / C) + 1; i++)
+      for (let d = 0; d < 2; d++) { const h = getSeg(0, i, j, d); if (h) views.push({ seg: h, i0: 0, i1: h.n - 1 }); }
+  if (!views.length || segNearest(views, s.x, s.y).d > RING_R + RT.hw.half + 250) s.ring = ringSeg(s.key + '|ring', s.x, s.y);
+  return s.ring;
+}
 function streetsOf(s) {
   if (!s.streets) { s.streets = []; organicStreets(s); } // erst setzen: schützt vor Rekursion
+  if (!s.trimmed) { s.trimmed = true; trimAtHighway(s); }          // erst hier: die Autobahn braucht die Stadt
   return s.streets;
 }
 // Dorf und Kleinstadt: leicht gebogene Seitenstraßen zweigen von den Durchgangsstraßen ab,
@@ -872,6 +1146,7 @@ function organicStreets(s) {
       const x = x0 + dx * len * t - dy * b, y = y0 + dy * len * t + dx * b;
       // endet vor anderen Straßen, damit sich Seitenstraßen nicht verknäueln
       if (q * 14 > 100 && tooClose(x, y)) break;
+      if (ringOf(s) && Math.hypot(x - s.x, y - s.y) < RING_R + 45) break;   // nicht in den Kreisverkehr hinein
       xs.push(x); ys.push(y);
     }
     const n = xs.length;
@@ -888,7 +1163,7 @@ function organicStreets(s) {
   };
   for (let b = town ? 4 + Math.floor(rng() * 3) : 1 + Math.floor(rng() * 3); b > 0; b--) {
     const [g, atStart] = inc[Math.floor(rng() * inc.length)];
-    const dk = Math.round((50 + rng() * s.R * 0.7) / g.step);
+    const dk = Math.round(((town ? RING_R + 50 : 50) + rng() * s.R * 0.7) / g.step);
     const k = clamp(atStart ? dk : g.n - 1 - dk, 1, g.n - 2), side = rng() < 0.5 ? 1 : -1;
     const a = Math.atan2(g.ny[k] * side, g.nx[k] * side) + (rng() - .5) * 0.7;
     branch(g.xs[k], g.ys[k], Math.cos(a), Math.sin(a), s.R * (0.45 + rng() * 0.5), 0);
@@ -969,7 +1244,10 @@ function settlementBuildings(s) {
   const railV = railsNear(s.x - s.R - 100, s.y - s.R - 100, s.x + s.R + 100, s.y + s.R + 100);
   const clearOf = (x, y, w, h, ang, pad, checkOverlap) => {
     const c = Math.cos(ang), sn = Math.sin(ang);
-    for (const [u, v] of [[0, 0], [-w / 2, -h / 2], [w / 2, -h / 2], [-w / 2, h / 2], [w / 2, h / 2]]) {
+    const pts = [[0, 0]], nu = Math.ceil(w / 16), nv = Math.ceil(h / 16);   // Mitte und Rand in kurzen Abständen
+    for (let q = 0; q <= nu; q++) { const u = -w / 2 + w * q / nu; pts.push([u, -h / 2], [u, h / 2]); }
+    for (let q = 1; q < nv; q++) { const v = -h / 2 + h * q / nv; pts.push([-w / 2, v], [w / 2, v]); }
+    for (const [u, v] of pts) {
       const px = x + u * c - v * sn, py = y + u * sn + v * c;
       const R = roadQuery(px, py, views);
       if (R.seg && R.edge - R.seg.sh < pad) return false;
@@ -979,7 +1257,10 @@ function settlementBuildings(s) {
     const r = Math.hypot(w, h) / 2;
     return !checkOverlap || !B.some(o => Math.hypot(o.x - x, o.y - y) < (o.r + r) * 0.85);
   };
-  const tree = (x, y) => { if (clearOf(x, y, 20, 20, 0, 4, true)) B.push(makeTree(rng, x, y)); };
+  const tree = (x, y) => {
+    if (railV.length && railQuery(x, y, railV).edge < RAIL_CLEAR) return;   // keine Bäume direkt an den Gleisen
+    if (clearOf(x, y, 20, 20, 0, 4, true)) B.push(makeTree(rng, x, y));
+  };
   if (s.kind === 'city') cityBuildings(s, B, rng, views, clearOf, tree);
   else organicBuildings(s, B, rng, views, clearOf, tree);
   return B;
@@ -1194,8 +1475,8 @@ function findRailCrossings(c) {
       let L = levelCache.get(key);
       if (!L) {
         const sin = Math.max(0.35, Math.abs(r.nx[p.ia] * s.ny[p.ib] - r.ny[p.ia] * s.nx[p.ib]));
-        if (s.net === 0) {                                           // Autobahn auf einer Brücke über die Bahn
-          L = { deck: true, x: p.x, y: p.y, span: (RAIL_HALF + 14) / sin + 16, upV: chainViews(s, p.x, p.y, 600) };
+        if (s.net === 0) {                                           // Eisenbahnbrücke über die Autobahn
+          L = { deck: true, railUp: true, x: p.x, y: p.y, span: (s.half + s.sh + 10) / sin + 20, rseg: r };
         } else {
           const barrier = s.type === 'road' || (s.type === 'street' && s.skind !== 'village');
           L = { deck: false, x: p.x, y: p.y, seg: s, k: p.ib, barrier, closed: 0, sin };
@@ -1270,7 +1551,7 @@ function polyLine(g, s, off, w, col, dash, pred) {
     const x = s.xs[k] + s.nx[k] * off, y = s.ys[k] + s.ny[k] * off;
     if (k) len += Math.hypot(x - px, y - py);
     px = x; py = y;
-    if (pred && !pred(k, x, y)) { if (open) { g.stroke(); open = false; } continue; }
+    if ((pred && !pred(k, x, y)) || (s.skip && s.skip[k])) { if (open) { g.stroke(); open = false; } continue; }
     if (open) g.lineTo(x, y);
     else { g.beginPath(); g.lineDashOffset = len; g.moveTo(x, y); open = true; }
   }
@@ -1286,6 +1567,7 @@ function onAnyBody(x, y, views) {
     for (let k = v.i0; k < v.i1; k++) {
       const ax = o.xs[k], ay = o.ys[k];
       if (Math.abs(x - ax) > m || Math.abs(y - ay) > m) continue;
+      if (o.skip && (o.skip[k] || o.skip[k + 1])) continue;
       const bx = o.xs[k + 1] - ax, by = o.ys[k + 1] - ay, px = x - ax, py = y - ay;
       let t = (px * bx + py * by) / (bx * bx + by * by);
       if ((k === 0 && t < 0) || (k === o.n - 2 && t > 1)) continue;
@@ -1311,15 +1593,103 @@ function markPred(c, s) {
   return (k, x, y) => x < x0 || x > x1 || y < y0 || y > y1 || !onAnyBody(x, y, others);
 }
 
-function drawMarkings(g, s, p) {
+// Lage einer Rampe zu Autobahn und Straße je Stützpunkt (einmal berechnet): Abstand der Mittellinie
+// zum Autobahnrand bzw. Straßenrand (negativ = darin) und nächster Punkt auf der Autobahn
+function rampGeom(s) {
+  if (s.geom) return s.geom;
+  const h = s.hwRef, r = s.roadRef, hv = [{ seg: h, i0: 0, i1: h.n - 1 }], rv = [{ seg: r, i0: 0, i1: r.n - 1 }];
+  const gH = new Float32Array(s.n), gR = new Float32Array(s.n), hx = new Float32Array(s.n), hy = new Float32Array(s.n);
+  for (let k = 0; k < s.n; k++) {
+    const N = segNearest(hv, s.xs[k], s.ys[k]);
+    gH[k] = N.d - h.half; hx[k] = N.x; hy[k] = N.y;
+    gR[k] = segNearest(rv, s.xs[k], s.ys[k]).d - r.half;
+  }
+  const m = s.n >> 1;                                                // Innenseite = zur Autobahn hin
+  const inner = Math.sign((hx[m] - s.xs[m]) * s.nx[m] + (hy[m] - s.ys[m]) * s.ny[m]) || 1;
+  return s.geom = { gH, gR, hx, hy, inner };
+}
+// Rampe: Randlinien, Sperrfläche im Zwickel zur Autobahn, Breitstrich an der Abzweigung,
+// Wartelinie an der Einmündung in die Straße, Leitplanke an der Außenkurve
+function drawRampMarkings(g, s, p) {
+  const G = rampGeom(s), h = s.half, ins = G.inner, ok = k => !p || p(k, s.xs[k], s.ys[k]);
+  polyLine(g, s, -ins * (h - 2), 1.6, MARK, null, k => ok(k) && G.gR[k] > 0 && G.gH[k] > -h + 4);
+  polyLine(g, s, ins * (h - 2), 1.6, MARK, null, k => ok(k) && G.gR[k] > 0 && G.gH[k] > h);
+  guardrail(g, s, -ins * (h + RAMP_RAIL), k => ok(k) && G.gR[k] > 30);                     // außen ganz
+  guardrail(g, s, ins * (h + RAMP_RAIL), k => ok(k) && G.gR[k] > 30 && G.gH[k] > 28);      // innen hinter dem Zwickel
+  g.strokeStyle = MARK; g.lineWidth = 1.6; g.setLineDash([]);
+  g.beginPath();
+  for (let k = 0; k < s.n; k++) {                                    // Sperrfläche: Querstreifen
+    const gap = G.gH[k] - h;
+    if (gap < 1 || gap > 36) continue;
+    const ix = s.xs[k] + s.nx[k] * ins * h, iy = s.ys[k] + s.ny[k] * ins * h;
+    const dx = G.hx[k] - s.xs[k], dy = G.hy[k] - s.ys[k], dl = Math.hypot(dx, dy) || 1;
+    const ex = G.hx[k] - dx / dl * (7.5 + LANE * 2), ey = G.hy[k] - dy / dl * (7.5 + LANE * 2);
+    g.moveTo(ix, iy); g.lineTo(ex, ey);
+  }
+  g.stroke();
+  g.beginPath();                                                     // Breitstrich entlang der Autobahn
+  let open = false;
+  for (let k = 0; k < s.n; k++) {
+    if (G.gH[k] >= h) { open = false; continue; }
+    const dx = G.hx[k] - s.xs[k], dy = G.hy[k] - s.ys[k], dl = Math.hypot(dx, dy) || 1;
+    const x = G.hx[k] - dx / dl * (7.5 + LANE * 2), y = G.hy[k] - dy / dl * (7.5 + LANE * 2);
+    if (open) g.lineTo(x, y); else { g.moveTo(x, y); open = true; }
+  }
+  g.lineWidth = 3.4; g.setLineDash([10, 8]); g.stroke(); g.setLineDash([]);
+  for (let k = s.n - 2; k > 0; k--) if (G.gR[k] > 0) {                // Wartelinie an der Einmündung
+    const x = s.xs[k], y = s.ys[k], nx = s.nx[k], ny = s.ny[k];
+    g.lineWidth = 3; g.setLineDash([4, 4]);
+    g.beginPath(); g.moveTo(x + nx * h, y + ny * h); g.lineTo(x - nx * h, y - ny * h); g.stroke(); g.setLineDash([]);
+    break;
+  }
+}
+
+// Schotterstraße: Steinchen in wechselnden Tönen, ausgefranster Rand, Schlaglöcher und Pfützen.
+// Alles aus Segment und Stützpunkt abgeleitet, damit benachbarte Chunks dasselbe zeichnen.
+function gravelTexture(g, s, c) {
+  if (s.hseed === undefined) { let h = 7; for (const ch of s.key) h = (h * 31 + ch.charCodeAt(0)) | 0; s.hseed = h; }
+  const x0 = c.cx * CS - 30, y0 = c.cy * CS - 30, x1 = x0 + CS + 60, y1 = y0 + CS + 60, H = s.half;
+  const stones = ['rgba(214,202,176,0.75)', 'rgba(120,104,80,0.6)', 'rgba(176,160,128,0.8)', 'rgba(90,78,62,0.5)'];
+  for (let k = 0; k < s.n - 1; k++) {
+    const bx = s.xs[k], by = s.ys[k];
+    if (bx < x0 || bx > x1 || by < y0 || by > y1) continue;
+    const tx = s.xs[k + 1] - bx, ty = s.ys[k + 1] - by, nx = s.nx[k], ny = s.ny[k];
+    const r = q => hash(s.hseed, k * 64 + q, SEED + 950);
+    for (let q = 0; q < 22; q++) {                                   // Steinchen auf der Fahrbahn
+      const f = r(q * 3), o = (r(q * 3 + 1) * 2 - 1) * (H - 1), sz = 0.8 + r(q * 3 + 2) * 1.6;
+      g.fillStyle = stones[q % 4];
+      g.fillRect(bx + tx * f + nx * o - sz / 2, by + ty * f + ny * o - sz / 2, sz, sz);
+    }
+    for (let q = 0; q < 6; q++) {                                    // ausgefranster Rand, lose Steine daneben
+      const side = q % 2 ? 1 : -1, f = r(100 + q), o = side * (H - 2 + r(110 + q) * 6), sz = 1.2 + r(120 + q) * 1.8;
+      g.fillStyle = q % 3 ? 'rgba(150,134,104,0.8)' : 'rgba(84,70,52,0.55)';
+      g.fillRect(bx + tx * f + nx * o - sz / 2, by + ty * f + ny * o - sz / 2, sz, sz);
+    }
+    const h = r(200);
+    if (h < 0.06) {                                                  // Pfütze in einer Fahrspur
+      const o = (r(201) < .5 ? -1 : 1) * 10, px = bx + nx * o, py = by + ny * o, a = Math.atan2(ty, tx);
+      g.fillStyle = 'rgba(70,58,42,0.55)'; g.beginPath(); g.ellipse(px, py, 7 + r(202) * 5, 4, a, 0, TAU); g.fill();
+      g.fillStyle = 'rgba(120,150,170,0.55)'; g.beginPath(); g.ellipse(px, py, 5 + r(202) * 4, 2.6, a, 0, TAU); g.fill();
+      g.fillStyle = 'rgba(255,255,255,0.35)'; g.fillRect(px - 2, py - 1, 2.5, 0.8);
+    } else if (h < 0.14) {                                           // Schlagloch
+      const o = (r(203) * 2 - 1) * (H - 6), px = bx + tx * .5 + nx * o, py = by + ty * .5 + ny * o, rr = 2 + r(204) * 2.5;
+      g.fillStyle = 'rgba(60,50,36,0.6)'; g.beginPath(); g.arc(px, py, rr, 0, TAU); g.fill();
+      g.fillStyle = 'rgba(200,186,156,0.6)'; g.beginPath(); g.arc(px - rr * .3, py - rr * .3, rr * .45, 0, TAU); g.fill();
+    }
+  }
+}
+
+function drawMarkings(g, s, p, pEdge = p) {
   const h = s.half;
   if (s.type === 'hw') {
     polyLine(g, s, 0, 5, '#a3a8ae', null, p);                          // Mittelleitplanke
     for (const sg of [-1, 1]) {
       polyLine(g, s, sg * 6.5, 1.6, MARK, null, p);
       polyLine(g, s, sg * (7.5 + LANE), 1.6, MARK, [22, 26], p);      // Fahrstreifenbegrenzung
-      polyLine(g, s, sg * (7.5 + LANE * 2), 2, MARK, null, p);        // Randlinie
+      polyLine(g, s, sg * (7.5 + LANE * 2), 2, MARK, null, pEdge);    // Randlinie
     }
+  } else if (s.type === 'ramp') {
+    drawRampMarkings(g, s, p);
   } else if (s.type === 'road') {
     polyLine(g, s, 0, 1.8, MARK, [20, 22], p);
     polyLine(g, s, -(LANE + 1), 1.8, MARK, null, p);
@@ -1330,10 +1700,24 @@ function drawMarkings(g, s, p) {
       polyLine(g, s, -h, 1.5, '#8b877f', null, p);                    // Bordsteine
       polyLine(g, s, h, 1.5, '#8b877f', null, p);
     }
+  } else if (s.type === 'ring') {
+    const ins = s.inner;
+    // Rasen der Insel überdeckt die runden Enden der einmündenden Straßen
+    g.fillStyle = climateT(s.cx, s.cy) < COLD_T ? '#e6ebf0' : '#5f9a48';
+    g.beginPath(); g.arc(s.cx, s.cy, RING_R - h - 5, 0, TAU); g.fill();
+    polyLine(g, s, ins * (h + 3), 6, '#a7a39a', null, p);              // Pflasterstreifen am Innenrand
+    polyLine(g, s, ins * (h + 6.5), 2, '#8b877f', null, p);            // Bordstein der Insel
+    polyLine(g, s, -ins * (h - 2.5), 1.8, MARK, null, p);              // äußere Randlinie
+    const cols = ['#e04a6a', '#f2c230', '#9b59d0', '#ffffff', '#ff8a3a'];
+    for (let q = 0; q < 46; q++) {                                   // Blumenbeet auf der Insel
+      const a = hash(q, 1, SEED + 960) * TAU, rr = 22 + hash(q, 2, SEED + 960) * 14;
+      g.fillStyle = cols[q % cols.length];
+      g.beginPath(); g.arc(s.cx + Math.cos(a) * rr, s.cy + Math.sin(a) * rr, 1.6, 0, TAU); g.fill();
+    }
   } else if (s.type === 'track') {
-    polyLine(g, s, 0, 5, 'rgba(96,128,62,0.55)', null, p);            // Grasnarbe in der Mitte
-    polyLine(g, s, -11, 5, 'rgba(110,90,60,0.5)', null, p);           // Fahrspuren
-    polyLine(g, s, 11, 5, 'rgba(110,90,60,0.5)', null, p);
+    polyLine(g, s, -10, 7, 'rgba(98,80,56,0.42)', null, p);           // festgefahrene Fahrspuren
+    polyLine(g, s, 10, 7, 'rgba(98,80,56,0.42)', null, p);
+    polyLine(g, s, 0, 4, 'rgba(206,192,160,0.45)', [5, 3], p);         // Mittelgrat aus losem Schotter
   }
   if (s.mtn) {                                                        // Leitplanken im Gebirge
     for (const sg of [-1, 1]) {
@@ -1347,24 +1731,35 @@ function drawRoads(c) {
   g.save();
   g.translate(-c.cx * CS, -c.cy * CS);
   g.lineJoin = 'round';
-  const segs = c.segs.map(v => v.seg);
+  // alle Straßen einer Ebene in gemeinsamen Durchgängen (erst Bankette, dann Fahrbahnen, dann
+  // Markierungen), damit Kreuzungen und Einmündungen nahtlos ineinander übergehen
+  const segs = c.segs.map(v => v.seg).sort((a, b) => (b.type === 'track') - (a.type === 'track'));   // Schotter zuerst
   const wetPred = s => k => s.water[k] || s.water[k - 1] || s.water[k + 1];
-  for (const net of [2, 3, 1, 0]) {
-    const list = segs.filter(s => s.net === net);
-    g.lineCap = 'butt';
-    for (const s of list) if (s.hasWater) {
-      g.save(); g.translate(7, 9);
-      polyLine(g, s, 0, s.half * 2 + 4, 'rgba(0,0,0,0.28)', null, wetPred(s));
-      g.restore();
-    }
-    g.lineCap = 'round';
-    for (const s of list) {
-      if (s.sh) polyLine(g, s, 0, (s.half + s.sh) * 2, shoulderCol(s), null, k => !s.water[k]);
-      else polyLine(g, s, 0, s.half * 2 + 6, 'rgba(84,66,42,0.35)');
-    }
-    for (const s of list) polyLine(g, s, 0, s.half * 2, s.col);
-    g.lineCap = 'butt';
-    for (const s of list) drawMarkings(g, s, markPred(c, s));
+  g.lineCap = 'butt';
+  for (const s of segs) if (s.hasWater) {
+    g.save(); g.translate(7, 9);
+    polyLine(g, s, 0, s.half * 2 + 4, 'rgba(0,0,0,0.28)', null, wetPred(s));
+    g.restore();
+  }
+  g.lineCap = 'round';
+  for (const s of segs) if (!s.sh) polyLine(g, s, 0, s.half * 2 + 6, 'rgba(84,66,42,0.35)');
+  for (const s of segs) if (s.sh) polyLine(g, s, 0, (s.half + s.sh) * 2, shoulderCol(s), null, k => !s.water[k]);
+  for (const s of segs) if (s.type === 'track') polyLine(g, s, 0, s.half * 2, s.col);
+  for (const s of segs) if (s.type === 'track') gravelTexture(g, s, c);
+  for (const s of segs) if (s.type !== 'track') polyLine(g, s, 0, s.half * 2, s.col);
+  g.lineCap = 'butt';
+  const ramps = c.segs.filter(v => v.seg.type === 'ramp');
+  for (const s of segs) {
+    const p = markPred(c, s);
+    // Autobahn: Randlinie dort unterbrechen, wo eine Rampe abzweigt (dort steht ein Breitstrich)
+    const pe = s.type === 'hw' && ramps.length ? (k, x, y) => (!p || p(k, x, y)) && !onAnyBody(x, y, ramps) : p;
+    drawMarkings(g, s, p, pe);
+  }
+  // Leitplanken der Autobahn: durchgehend, offen nur an Rampen und Autobahnkreuzen
+  for (const s of segs) if (s.type === 'hw') {
+    const others = c.segs.filter(v => v.seg.net === 0 && v.seg !== s && !(v.seg.dir === s.dir && (s.dir ? v.seg.i === s.i : v.seg.j === s.j)));
+    const pred = (k, x, y) => !s.water[k] && !onAnyBody(x, y, ramps) && (!others.length || segNearest(others, x, y).d > s.half + s.sh);
+    guardrail(g, s, -HW_RAIL, pred); guardrail(g, s, HW_RAIL, pred);
   }
   for (const s of segs) if (s.hasWater) {
     const p = wetPred(s);
@@ -1384,7 +1779,7 @@ const FOREST_G = 20;
 const AUTUMN_PAL = [[176, 84, 34], [196, 140, 40], [150, 52, 36], [96, 112, 46]];
 function forestCrown(gx, gy, x, y, scale) {
   const h1 = hash(gx, gy, SEED + 13), id = Math.floor(hash(gx, gy, SEED + 14) * 4) / 4, h3 = hash(gx, gy, SEED + 15);
-  const cold = fbm(x / 2400, y / 2400, SEED + 31, 3) < 0.39, aut = !cold && autumnAt(x, y);
+  const cold = climateT(x, y) < COLD_T, aut = !cold && autumnAt(x, y);
   const conifer = cold ? h3 < 0.85 : h3 < (aut ? 0.2 : 0.3);
   const rr = FOREST_G * (0.7 + 0.5 * h1) * scale;
   let col, key;
@@ -1471,13 +1866,21 @@ function buildCanopy(c) {
       // Randkrone (nur vom Chunk, in dem sie liegt, ins Overlay)
       if (px < ox || px >= ox + CS || py < oy || py >= oy + CS) continue;
       const l = Math.hypot(dx, dy) || 1, ux = dx / l, uy = dy / l;
-      const cr = forestCrown(gx, gy, px + ux * 5, py + uy * 5, 1.12);
+      let cr = forestCrown(gx, gy, px + ux * 5, py + uy * 5, 1.12);
+      if (c.rails.length) {                                          // an Gleisen kleiner, damit nichts ins Gleis ragt
+        const e = railQuery(cr.x, cr.y, c.rails).edge;
+        if (e < cr.rr + 20) {
+          if (e < 30) continue;
+          cr = forestCrown(gx, gy, cr.x, cr.y, 1.12 * (e - 20) / cr.rr);
+        }
+      }
       addCrown(edge, edgeSh, cr, 9);
       // Waldmantel: Sträucher und junge Bäume vor dem Rand
       if (open >= 2 && hash(gx, gy, SEED + 18) < 0.55) {
         const d = cr.rr * 0.9 + 6 + hash(gx, gy, SEED + 19) * 10, sx = px + ux * d, sy = py + uy * d;
         const R = roadQuery(sx, sy, c.segs);
-        if ((!R.seg || R.edge > 4) && !SURF[localSurf(c, sx, sy)].solid && !isRoadSurf(localSurf(c, sx, sy))) {
+        const nearRail = c.rails.length && railQuery(sx, sy, c.rails).edge < RAIL_CLEAR;
+        if ((!R.seg || R.edge > 4) && !nearRail && !SURF[localSurf(c, sx, sy)].solid && !isRoadSurf(localSurf(c, sx, sy))) {
           const sh = forestCrown(gx + 7919, gy, sx, sy, 0.45);
           sh.col = sh.col.map(v => v * 1.08); sh.key += 's';
           addCrown(edge, edgeSh, sh, 5);
@@ -1511,7 +1914,7 @@ function genObstacles(c) {
       const R = roadQuery(x, y, c.segs);
       const clear = R.seg && R.seg.type === 'track' ? TRACK_VERGE : R.seg ? R.seg.sh : 0;
       if (R.seg && R.edge - clear < r * 0.7 + 3) return false;
-      if (c.rails.length && railQuery(x, y, c.rails).edge < r * 0.7 + 10) return false;
+      if (c.rails.length && railQuery(x, y, c.rails).edge < r + RAIL_CLEAR - 8) return false;   // volle Krone plus Abstand
     }
     for (const o of S) if (Math.hypot(o.x - x, o.y - y) < o.r + r + 8) return false;
     for (const o of D) if (Math.hypot(o.x - x, o.y - y) < o.r + r + 4) return false;
@@ -1555,7 +1958,7 @@ function genObstacles(c) {
       else if (r < 0.3) { addDyn('crate', x, y); continue; }
     } else if (s === S_ROCK) {
       if (r < 0.14) o = makeRock(rng, x, y, 1.6);
-      else if (r < 0.2) o = { ...makeTree(rng, x, y), t: 'pine', snow: fbm(x / 2400, y / 2400, SEED + 31, 3) < 0.45 };
+      else if (r < 0.2) o = { ...makeTree(rng, x, y), t: 'pine', snow: climateT(x, y) < COLD_T + 0.04 };
     } else if (s === S_PASTURE) {
       if (r < 0.16) {                                   // kleine Herde
         const kind = parcelAt(x, y).animal, n = 3 + Math.floor(rng() * 4);
@@ -1577,6 +1980,9 @@ function genObstacles(c) {
     }
     if (o && free(o.x, o.y, o.r)) S.push(o);
   }
+  // Mittelinsel eines Kreisverkehrs: unsichtbares rundes Hindernis (Bordstein), gezeichnet wird sie mit dem Ring
+  for (const st of c.setl) if (ringOf(st) && st.x >= ox && st.x < ox + CS && st.y >= oy && st.y < oy + CS)
+    S.push({ t: 'island', x: st.x, y: st.y, r: (RING_R - RT.ring.half - 3) / 0.9 });
   // Gebäude der Siedlungen gehören dem Chunk, in dem ihr Mittelpunkt liegt
   for (const st of c.setl) for (const b of settlementBuildings(st)) {
     if (b.x >= ox && b.x < ox + CS && b.y >= oy && b.y < oy + CS) S.push(b);
@@ -1762,8 +2168,46 @@ function gatherNearby() {
                          ang: Math.atan2(P.ay, P.ax), r: P.len / 2 });
     }
   updateZone();
+  // Rampen liegen am Boden; auf ihnen gelten die Wände der Kreuzung nicht
+  const RV = roadQuery(car.x, car.y, segsNear(car.x, car.y, car.x, car.y).filter(v => v.seg.type === 'ramp'));
+  const wasRamp = car.onRamp;
+  car.onRamp = RV.seg && RV.edge < 0 ? RV.seg : null;
+  if (car.onRamp) car.upper = false;
+  else if (wasRamp) { const z = car.zone; car.upper = !!z && segNearest(z.upV, car.x, car.y).d < z.up.half + z.up.sh; }
   const R = roadQuery(car.x, car.y, segsNear(car.x, car.y, car.x, car.y));
   car.inTunnel = !car.upper && !!R.seg && !!R.seg.tunnel && R.edge < R.seg.sh + TUNNEL_EXTRA && !!R.seg.tunnel[R.k];
+}
+
+// Leitplanken der Autobahn (außen am Bankett) und der Rampen (bis kurz vor der Straße): Wer auf der
+// Autobahn ist, bleibt darauf, wer draußen ist, bleibt draußen – Übergang nur über die Rampen.
+const HW_RAIL = RT.hw.half + RT.hw.sh - 1, RAMP_RAIL = 3;   // Autobahn: Abstand zur Mitte, Rampe: zum Rand
+function rampFenced(r, k) { return rampGeom(r).gR[k] > 30; }
+function highwayWalls() {
+  if (car.upper) return;
+  const near = segsNear(car.x, car.y, car.x, car.y);
+  const hws = near.filter(v => v.seg.net === 0), ramps = near.filter(v => v.seg.type === 'ramp');
+  if (!hws.length) return;
+  const onHw = segNearest(hws, car.x, car.y).d < HW_RAIL;
+  const fx = Math.cos(car.a), fy = Math.sin(car.a);
+  for (const off of COFF) {
+    const px = car.x + fx * off, py = car.y + fy * off;
+    const N = segNearest(hws, px, py), d = N.d || 1e-3, nx = (px - N.x) / d, ny = (py - N.y) / d;
+    const R = ramps.length ? roadQuery(px, py, ramps) : null, rs = R && R.seg, rk = R && R.k, re = R ? R.edge : 1e9;
+    if (car.onRamp) {
+      // auf der Rampe: seitlich nur zur Autobahn hin offen und am Ende zur Straße
+      if (d < HW_RAIL || !rs || re < RAMP_RAIL - CR || !rampFenced(rs, rk)) continue;
+      const M = segNearest([{ seg: rs, i0: 0, i1: rs.n - 1 }], px, py), dm = M.d || 1e-3;
+      resolveStatic(px, py, (M.x - px) / dm, (M.y - py) / dm, re - RAMP_RAIL + CR, 0.2, 0.01);
+    } else if (onHw) {
+      if (d > HW_RAIL - CR && re > 0) resolveStatic(px, py, -nx, -ny, d - HW_RAIL + CR, 0.2, 0.01);
+    } else {
+      if (d < HW_RAIL + CR && !(re < 0 && !rampFenced(rs, rk))) resolveStatic(px, py, nx, ny, HW_RAIL + CR - d, 0.25, 0.01);
+      else if (rs && re < RAMP_RAIL + CR && rampFenced(rs, rk)) {   // nicht seitlich auf die Rampe
+        const M = segNearest([{ seg: rs, i0: 0, i1: rs.n - 1 }], px, py), dm = M.d || 1e-3;
+        resolveStatic(px, py, (px - M.x) / dm, (py - M.y) / dm, RAMP_RAIL + CR - re, 0.25, 0.01);
+      }
+    }
+  }
 }
 
 function updateZone() {
@@ -2106,7 +2550,8 @@ function resolveStatic(px, py, nx, ny, pen, e, fric = 0.08) {
 }
 
 function collide() {
-  if (car.zone) crossingWalls();
+  highwayWalls();
+  if (car.zone && !car.onRamp) crossingWalls();
   if (car.upper) return; // auf der Brücke gibt es nichts, woran man stoßen könnte
   const fx = Math.cos(car.a), fy = Math.sin(car.a);
   for (const off of COFF) {
@@ -2612,8 +3057,25 @@ function drawLevel(L) {
     ctx.fillStyle = L.active && !blink ? '#ff3b2a' : '#5a1a16'; circle(P.x - P.ay * 3, P.y + P.ax * 3, 1.8);
   }
 }
-function drawTrains() {
+// Eisenbahnbrücke über der Autobahn: Betonkante, Schotter, Schwellen, Schienen, Geländer
+function drawRailDeck(L) {
+  const s = L.rseg, p = k => Math.hypot(s.xs[k] - L.x, s.ys[k] - L.y) <= L.span;
+  ctx.lineJoin = 'round'; ctx.lineCap = 'butt';
+  ctx.save(); ctx.translate(11, 14); polyLine(ctx, s, 0, RAIL_HALF * 2 + 8, 'rgba(0,0,0,0.32)', null, p); ctx.restore();
+  polyLine(ctx, s, 0, (RAIL_HALF + 4) * 2, '#8b8e94', null, p);
+  polyLine(ctx, s, 0, RAIL_HALF * 2, '#8a8174', null, p);
+  polyLine(ctx, s, 0, 15, '#4b3a2c', [2.6, 3.6], p);
+  for (const sd of [-1, 1]) {
+    polyLine(ctx, s, sd * RAIL_GAUGE, 1.8, '#7d838a', null, p);
+    polyLine(ctx, s, sd * RAIL_GAUGE - 0.4, 0.7, '#c8ccd0', null, p);
+    polyLine(ctx, s, sd * (RAIL_HALF + 2.5), 2.5, '#d9d3c5', null, p);
+  }
+  ctx.setLineDash([]);
+}
+// Züge; filter wählt Wagen auf Eisenbahnbrücken (über der Autobahn) bzw. alle anderen
+function drawTrains(filter) {
   for (const t of trains) for (const w of t.laid) {
+    if (filter && !filter(w)) continue;
     const hl = w.len / 2, hw = w.type === 'loco' ? 7 : 6.5;
     ctx.save(); ctx.translate(w.x, w.y); ctx.rotate(w.a);
     ctx.fillStyle = 'rgba(0,0,0,0.3)'; ctx.fillRect(-hl + 4, -hw + 5, w.len, hw * 2);
@@ -2670,21 +3132,21 @@ let assistOn = false;
 const ASSIST_LAT = 650; // zulässige Querbeschleunigung in px/s² für das Kurventempo
 function laneCenters(s) {
   if (s.type === 'hw') return [7.5 + LANE / 2, 7.5 + LANE * 1.5];
-  if (s.type === 'track') return [0];
+  if (s.type === 'track' || s.type === 'ramp' || s.type === 'ring') return [0];
   return [s.half / 2];
 }
 function computeAssist() {
   car.assistActive = false; car.assistSteer = 0; car.assistPath = null; car.assistBrake = false;
   if (!assistOn || car.air > 0 || car.vf < 50) return;
-  const z = car.zone, views = z ? (car.upper ? z.upV : z.loV) : segsNear(car.x, car.y, car.x, car.y);
+  const z = car.zone, views = z && !car.onRamp ? (car.upper ? z.upV : z.loV) : segsNear(car.x, car.y, car.x, car.y);
   // bei der bisher verfolgten Straße (oder ihrer Fortsetzung) bleiben, damit Kreuzungen nicht abbiegen lassen
   let s = null, k = 0;
   const prev = car.assistSeg;
   if (prev) {
-    let be = 4;
+    let be = 14;
     for (const v of views) {
       const q = v.seg;
-      const same = q === prev || (q.net === prev.net && q.net !== 3 && q.dir === prev.dir && (q.dir ? q.i === prev.i : q.j === prev.j));
+      const same = q === prev || (q.net === prev.net && q.net < 3 && q.dir === prev.dir && (q.dir ? q.i === prev.i : q.j === prev.j));
       if (!same) continue;
       const R1 = roadQuery(car.x, car.y, [v]);
       if (R1.seg && R1.edge <= be) { be = R1.edge; s = R1.seg; k = R1.k; }
@@ -2692,7 +3154,7 @@ function computeAssist() {
   }
   if (!s) {
     const R = roadQuery(car.x, car.y, views);
-    if (!R.seg || R.edge > 6) { car.assistSeg = null; return; }
+    if (!R.seg || R.edge > 10) { car.assistSeg = null; return; }
     s = R.seg; k = R.k;
   }
   car.assistSeg = s;
@@ -2703,17 +3165,18 @@ function computeAssist() {
   let target = 0, bd = Infinity;
   for (const c of laneCenters(s)) if (Math.abs(c - carOff) < bd) { bd = Math.abs(c - carOff); target = c; }
   // Weg voraus entlang der Straße, über Knoten hinweg (Lenkziel und Kurventempo)
-  const look = 30 + car.vf * 0.28, ahead = Math.max(look, 60 + car.vf * 0.9);
-  const pts = roadAhead(s, k, dir, target, ahead);
-  const path = [];
-  let goal = pts[pts.length - 1];
-  for (const p of pts) { path.push([p.x, p.y]); if (p.d >= look) { goal = p; break; } }
+  const pts = roadAhead(s, k, dir, target, Math.max(30 + car.vf * 0.28, 60 + car.vf * 0.9));
   let kmax = 0;
   for (const p of pts) if (p.d > 25) {
     let dth = p.a - pts[0].a;
     dth = Math.abs(Math.atan2(Math.sin(dth), Math.cos(dth)));
     kmax = Math.max(kmax, dth / p.d);
   }
+  // in engen Kurven näher vorausschauen, damit sie nicht abgeschnitten werden
+  const look = Math.max(22, (30 + car.vf * 0.28) / (1 + kmax * 150));
+  const path = [];
+  let goal = pts[pts.length - 1];
+  for (const p of pts) { path.push([p.x, p.y]); if (p.d >= look) { goal = p; break; } }
   // höchstes Tempo, bei dem die Lenkung die Krümmung noch schafft: Gierrate 2.7/(1+v/650) ≥ κ·v,
   // mit Sicherheitsfaktor; zusätzlich durch die zulässige Querbeschleunigung begrenzt
   const yawCap = 2.7 * 0.62;
@@ -2741,23 +3204,29 @@ function roadAhead(s, k, dir, lane, maxD) {
     if (++guard > 4) return out;
     const n = nextRoadSeg(s, dir > 0);
     if (!n) return out;
-    s = n.seg; dir = n.dir; k = n.dir > 0 ? 1 : s.n - 2;
+    s = n.seg; dir = n.dir; k = n.k;
   }
 }
 function nextRoadSeg(s, atEnd) {
   const i = atEnd ? s.n - 1 : 0, x = s.xs[i], y = s.ys[i];
   const ox = (atEnd ? 1 : -1) * s.ny[i], oy = (atEnd ? 1 : -1) * -s.nx[i];   // Richtung, in der man den Knoten verlässt
   let best = null, bs = -0.3;
-  for (const v of segsNear(x, y, x, y)) {
+  const views = segsNear(x, y, x, y);
+  for (const v of views) {
     const q = v.seg;
     if (q === s || q.type === 'track' && s.type !== 'track') continue;
     for (const [j, d] of [[0, 1], [q.n - 1, -1]]) {
       if (Math.hypot(q.xs[j] - x, q.ys[j] - y) > 4) continue;
       const sc = (q.ny[j] * d) * ox + (-q.nx[j] * d) * oy;
-      if (sc > bs) { bs = sc; best = { seg: q, dir: d }; }
+      if (sc > bs) { bs = sc; best = { seg: q, dir: d, k: d > 0 ? 1 : q.n - 2 }; }
     }
   }
-  return best;
+  if (best) return best;
+  // keine Fortsetzung am Ende (z. B. Rampe): in die vorbeiführende Straße einfädeln, möglichst gerade
+  const R = roadQuery(x + ox * 6, y + oy * 6, views.filter(v => v.seg !== s));
+  if (!R.seg || R.edge > 0) return null;
+  const q = R.seg, k = R.k, d = q.ny[k] * ox - q.nx[k] * oy >= 0 ? 1 : -1;
+  return { seg: q, dir: d, k };
 }
 function drawAssist() {
   const p = car.assistPath;
@@ -2787,6 +3256,7 @@ const HIGH = { tree: 1, pine: 1, house: 1, cactus: 1, bldg: 1, church: 1 };
 function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill(); }
 
 function drawShadow(o) {
+  if (o.t === 'island') return;
   ctx.fillStyle = 'rgba(0,0,0,0.22)';
   if (o.w) {
     // Schatten als Extrusion des Grundrisses: höhere Gebäude werfen längere Schatten
@@ -2991,6 +3461,11 @@ function drawDyn(o) {
 }
 
 // Das Deck kann über mehrere Segmente der oberen Straße reichen, daher Auswahl über den Abstand zur Kreuzung
+// Leitplanke: Stahlband mit dunklen Pfosten
+function guardrail(g, s, off, pred) {
+  polyLine(g, s, off, 2.6, '#d5d8dc', null, pred);
+  polyLine(g, s, off, 4, '#5b5f66', [2, 14], pred);
+}
 function drawDeck(z) {
   const segs = z.upV.map(v => v.seg);
   const preds = segs.map(s => k => Math.hypot(s.xs[k] - z.x, s.ys[k] - z.y) <= z.span);
@@ -3006,10 +3481,7 @@ function drawDeck(z) {
   segs.forEach((s, i) => polyLine(ctx, s, 0, (s.half + 4) * 2, '#8b8e94', null, preds[i])); // Brückenkante (Beton)
   segs.forEach((s, i) => polyLine(ctx, s, 0, s.half * 2, s.col, null, preds[i]));
   segs.forEach((s, i) => drawMarkings(ctx, s, preds[i]));
-  segs.forEach((s, i) => {                                                                  // Geländer
-    polyLine(ctx, s, -(s.half + 2.5), 3, '#dcd6c8', null, preds[i]);
-    polyLine(ctx, s, s.half + 2.5, 3, '#dcd6c8', null, preds[i]);
-  });
+  segs.forEach((s, i) => { guardrail(ctx, s, -(s.half + 2.5), preds[i]); guardrail(ctx, s, s.half + 2.5, preds[i]); });
   ctx.setLineDash([]);
 }
 
@@ -3376,7 +3848,6 @@ function render() {
   for (const o of highs) drawShadow(o);
   for (const o of lows) drawStatic(o);
   for (const o of dyns) drawDyn(o);
-  drawTrains();
   const railDecks = new Set(), levels = new Set();
   for (let cy = Math.floor(by0 / CS); cy <= Math.floor(by1 / CS); cy++) {
     for (let cx = Math.floor(bx0 / CS); cx <= Math.floor(bx1 / CS); cx++) {
@@ -3384,10 +3855,14 @@ function render() {
       if (c && c.done) { for (const z of c.railDecks) railDecks.add(z); for (const L of c.levels) levels.add(L); }
     }
   }
-  for (const z of railDecks) drawDeck(z);                           // Autobahnbrücken über die Bahn
+  const railUp = [...railDecks].filter(z => z.railUp);
+  const onRailBridge = w => railUp.some(z => Math.hypot(w.x - z.x, w.y - z.y) < z.span + w.len / 2);
+  drawTrains(w => !onRailBridge(w));
   for (const r of rods) if (r.landed) drawRod(r);
   drawAssist();
   if (!car.upper) drawCar();
+  for (const z of railUp) drawRailDeck(z);                         // Eisenbahnbrücken über der Autobahn
+  drawTrains(onRailBridge);
   for (const L of levels) drawLevel(L);
   const decks = new Set();
   for (let cy = Math.floor(by0 / CS); cy <= Math.floor(by1 / CS); cy++) {
@@ -3594,7 +4069,7 @@ let mapRow = 0, mapCX = 0, mapCY = 0, shownCX = 0, shownCY = 0, mapReady = false
 
 let mapRoads = [];
 let mapPlaces = [], mapRivers = [], mapRails = [];
-const MAP_ROAD_STYLE = { street: [1.2, '#e3e1da'], track: [1, '#7d6444'], lane: [1.5, '#d6d6cf'], road: [2, '#f4f4ef'], hw: [3.5, '#f2c14e'] };
+const MAP_ROAD_STYLE = { ring: [2, '#f4f4ef'], ramp: [1.5, '#f2c14e'], street: [1.2, '#e3e1da'], track: [1, '#7d6444'], lane: [1.5, '#d6d6cf'], road: [2, '#f4f4ef'], hw: [3.5, '#f2c14e'] };
 
 function mapWork(rows) {
   if (mapRow === 0) {
@@ -3753,6 +4228,8 @@ function newWorld(seed) {
   crossCache.clear();
   setlCache.clear();
   rivCache.clear();
+  rampCache.clear();
+  wetCache.clear();
   rods.length = 0;
   railCache.clear(); levelCache.clear(); trains.length = 0;
   allCrossings.length = 0;
