@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Kleiner Flitzer</title>
+<title>Car Game</title>
 <style>
   html, body { margin: 0; height: 100%; overflow: hidden; background: #1b1d22; color: #f1f1ee;
     font-family: ui-rounded, "SF Pro Rounded", system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -60,9 +60,11 @@
   <div><b>R</b>Neue Welt &nbsp; <b style="min-width:0">C</b> Fahrzeug &nbsp; <b style="min-width:0">H</b> Hilfe</div>
   <div><b>M</b>Sonderfunktion &nbsp; <b style="min-width:0">E</b> Schleudersitz (007)</div>
   <div><b>N</b>Nacht an/aus &nbsp; <b style="min-width:0">L</b> Spurhalteassistent</div>
+  <div><b>G</b>Godzilla &nbsp; (Leertaste: Feuerstrahl)</div>
+  <div><b>B</b>Airstrike (Reaper-Drohne)</div>
 </div>
 
-<div id="intro"><div><h1>Kleiner Flitzer</h1><p>Drück eine Taste und fahr los</p></div></div>
+<div id="intro"><div><h1>Car Game</h1><p>Drück eine Taste und fahr los</p></div></div>
 
 <script>
 'use strict';
@@ -1238,6 +1240,7 @@ function finalizeChunk(c) {
   if (c.rails.length) { drawRails(c); findRailCrossings(c); }
   buildCanopy(c);
   genObstacles(c);
+  for (const cr of craters) applyCrater(c, cr);                     // Krater bleiben nach dem Neuladen
   c.done = true;
 }
 
@@ -1750,12 +1753,14 @@ addEventListener('keydown', e => {
   if (!started) { started = true; document.getElementById('intro').style.opacity = 0; }
   if (e.repeat) return;
   if (e.code === 'KeyR') newWorld(Math.floor(Math.random() * 999999) + 1);
-  if (e.code === 'KeyC') { car.type = (car.type + 1) % CAR_TYPES.length; car.mode = false; }
+  if (e.code === 'KeyC' && !godz.on) { car.type = (car.type + 1) % CAR_TYPES.length; car.mode = false; }
   if (e.code === 'KeyM') carAction();
   if (e.code === 'KeyE') ejectSeat();
   if (e.code === 'KeyL') assistOn = !assistOn;
   if (e.code === 'KeyH') document.getElementById('help').classList.toggle('hidden');
   if (e.code === 'KeyN') night = !night;
+  if (e.code === 'KeyG') toggleGodzilla();
+  if (e.code === 'KeyB') callStrike();
 });
 addEventListener('keyup', e => { if (KEYMAP[e.code]) keys[KEYMAP[e.code]] = false; });
 addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
@@ -1767,7 +1772,7 @@ function gatherNearby() {
   for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
     const c = chunks.get(ckey(ccx + dx, ccy + dy));
     if (!c || !c.done) continue;
-    for (const o of c.statics) if (Math.abs(o.x - car.x) < o.r + 80 && Math.abs(o.y - car.y) < o.r + 80) nearStatics.push(o);
+    for (const o of c.statics) if (o.t !== 'rubble' && o.t !== 'wreck' && Math.abs(o.x - car.x) < o.r + 80 && Math.abs(o.y - car.y) < o.r + 80) nearStatics.push(o);
     for (const o of c.dyn) if (Math.abs(o.x - car.x) < 120 && Math.abs(o.y - car.y) < 120) nearDyn.push(o);
   }
   for (const t of trains) for (const w of t.laid)                    // Züge sind feste Hindernisse
@@ -1992,6 +1997,7 @@ function physics(dt) {
     }
     return;
   }
+  craterForce(dt);
   const fx = Math.cos(car.a), fy = Math.sin(car.a), rx = -fy, ry = fx;
 
   let G = 0, A = 0, T = 0, Dr = 0, B = 0;
@@ -2423,7 +2429,7 @@ function effects(dt) {
   car.bloody = Math.max(0, car.bloody - dt);
   const slipping = Math.abs(car.vl) > 70 || (keys.hand && speed > 60) ||
                    (car.braking && speed > 120 && SURF[car.ws[2]].brake < .6);
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 4 && !godz.on; i++) {
     const w = WHEELS[i];
     const x = car.x + fx * w[0] + rx * w[1], y = car.y + fy * w[0] + ry * w[1];
     const p = SURF[car.ws[i]];
@@ -2769,7 +2775,7 @@ function spawnVehicle(minD) {
                 f: (CAT_PACE[m.cat] || 0.5) * (0.8 + Math.random() * 0.4) };
     v.off = v.lane = laneFor(v, s);
     const P = vehPose(v);
-    if (traffic.some(o => Math.hypot(o.x - P.x, o.y - P.y) < 120)) continue;
+    if (traffic.some(o => Math.hypot(o.x - P.x, o.y - P.y) < 120) || inCrater(P.x, P.y, 1.3)) continue;
     v.x = P.x; v.y = P.y; v.a = Math.atan2(P.ty, P.tx);
     v.v = Math.min(roadKmh(s), m.kmh) / KMH * v.f * 0.8;
     if (m.art) for (let q = m.art + 60; q >= 0; q -= 6) v.trail.push([P.x - P.tx * q, P.y - P.ty * q]);
@@ -2839,7 +2845,7 @@ function trafficObstacles() {
     out.push({ x: v.x, y: v.y, a: v.a, L: v.m.L, W: v.m.W, id: v.id, v: v.v, src: v });
     if (v.tr) out.push({ x: v.tr.x, y: v.tr.y, a: v.tr.a, L: v.m.art, W: v.m.W, id: v.id, v: v.v, src: v });
   }
-  if (car.air <= 0) out.push({ x: car.x, y: car.y, a: car.a, L: 46, W: 24, id: 0, v: Math.hypot(car.vx, car.vy), player: true });
+  if (car.air <= 0) out.push({ x: car.x, y: car.y, a: car.a, L: godz.on ? 160 : 46, W: godz.on ? 90 : 24, id: 0, v: Math.hypot(car.vx, car.vy), player: true });
   for (const t of trains) for (const w of t.laid)
     if (Math.abs(w.x - car.x) < TRAFFIC_R + 200 && Math.abs(w.y - car.y) < TRAFFIC_R + 200)
       out.push({ x: w.x, y: w.y, a: w.a, L: w.len, W: 14, id: 0, v: 0, rail: true });
@@ -2912,6 +2918,9 @@ function updateTraffic(dt) {
       if (o.dead || !(o.person || o.animal)) continue;
       const dx = o.x - v.x, dy = o.y - v.y, fwd = dx * ca + dy * sa, lat = -dx * sa + dy * ca;
       if (fwd > 0 && fwd < m.L / 2 + 70 && Math.abs(lat) < m.W / 2 + o.r + 4) target = Math.min(target, Math.max(0, (fwd - m.L / 2 - o.r - 10) * 2));
+    }
+    if (inCrater(fx, fy, 1.15) && !(v.flipT > clock)) {               // vor dem Krater wenden (mitten im Teilstück)
+      v.k += v.dir; v.t = 1 - v.t; v.dir = -v.dir; v.next = null; v.v *= 0.3; v.flipT = clock + 2;
     }
     if (v.hit > 0) { v.hit -= dt; target = 0; }
     // Sicherheitsventil gegen verbliebene Verklemmungen: nach langem Stand kurz an anderen vorbei
@@ -3134,6 +3143,520 @@ function trafficLights(g, cut, k) {
   }
 }
 
+// ---------- Godzilla ----------
+// Mit G wird man zu Godzilla: ↑/↓ gehen, ←/→ drehen, mitten durch alles hindurch. Jeder Schritt
+// zertritt, was unter dem Fuß liegt (Häuser werden zu Trümmern, Fahrzeuge zu Wracks, Bäume
+// knicken um, Menschen und Tiere werden zertreten); die Leertaste speit einen Feuerstrahl, der
+// Häuser, Bäume und Fahrzeuge in Brand setzt und Menschen und Tiere verkohlt.
+const godz = { on: false, v: 0, phase: 0, breath: 0, trail: [] };
+const GZ = 2.2, GZ_SPEED = 130, GZ_TURN = 1.3, GZ_STEP = 80, BREATH_L = 380, BREATH_A = 0.24;
+const RAZE = { house: 1, bldg: 1, church: 1 }, FLORA = { tree: 1, pine: 1, cactus: 1, bush: 1 };
+const burning = [];
+function toggleGodzilla() {
+  godz.on = !godz.on;
+  Object.assign(car, { vx: 0, vy: 0, w: 0, vf: 0, vl: 0, air: 0, mode: false });
+  car.prevW = [null, null, null, null];
+  godz.v = 0; godz.trail = []; godz.breath = 0;
+  shake = Math.max(shake, 8);
+}
+function forChunksNear(x, y, rad, fn) {
+  for (let cy = Math.floor((y - rad) / CS); cy <= Math.floor((y + rad) / CS); cy++)
+    for (let cx = Math.floor((x - rad) / CS); cx <= Math.floor((x + rad) / CS); cx++) {
+      const c = chunks.get(ckey(cx, cy));
+      if (c && c.done) fn(c);
+    }
+}
+const gzFwd = () => [Math.cos(car.a), Math.sin(car.a)];
+function mouthPos() { const [fx, fy] = gzFwd(); return [car.x + fx * 60 * GZ, car.y + fy * 60 * GZ]; }
+
+function updateGodzilla(dt) {
+  const turn = (keys.right ? 1 : 0) - (keys.left ? 1 : 0), walk = (keys.up ? 1 : 0) - (keys.down ? 0.5 : 0);
+  car.a += turn * GZ_TURN * dt;
+  godz.v += (walk * GZ_SPEED - godz.v) * Math.min(1, dt * 3);
+  const [fx, fy] = gzFwd();
+  car.x += fx * godz.v * dt; car.y += fy * godz.v * dt;
+  car.vx = fx * godz.v; car.vy = fy * godz.v; car.vf = godz.v; car.vl = 0;
+  const last = godz.trail[godz.trail.length - 1];
+  if (!last || Math.hypot(car.x - last[0], car.y - last[1]) > 5) godz.trail.push([car.x, car.y]);
+  if (godz.trail.length > 70) godz.trail.shift();
+  // Schritte: bei jedem halben Gangzyklus setzt abwechselnd ein Fuß auf
+  if (Math.abs(godz.v) > 8 || turn) {
+    const before = Math.floor(godz.phase);
+    godz.phase += (Math.abs(godz.v) + (turn ? 45 : 0)) * dt / GZ_STEP;
+    if (Math.floor(godz.phase) !== before) {
+      const s = Math.floor(godz.phase) % 2 ? 1 : -1;
+      stomp(car.x + fx * 14 * GZ - fy * s * 17 * GZ, car.y + fy * 14 * GZ + fx * s * 17 * GZ);
+    }
+  }
+  godz.breath = keys.hand ? Math.min(1, godz.breath + dt * 4) : Math.max(0, godz.breath - dt * 3);
+  if (keys.hand) breathe(dt);
+  updateBurning(dt);
+}
+
+// Fußabdruck, Staub und alles im Umkreis zertreten
+function stomp(x, y) {
+  shake = Math.max(shake, 6);
+  const a = car.a, R = 15 * GZ;
+  paintGround(x, y, 40, g => {
+    g.fillStyle = 'rgba(40,30,22,0.32)';
+    g.beginPath(); g.ellipse(x, y, R, R * 0.75, a, 0, TAU); g.fill();
+    for (const t of [-0.5, 0, 0.5]) {                                // Zehen
+      const tx = x + Math.cos(a + t) * R * 1.25, ty = y + Math.sin(a + t) * R * 1.25;
+      g.beginPath(); g.ellipse(tx, ty, R * 0.35, R * 0.22, a + t, 0, TAU); g.fill();
+    }
+  });
+  for (let k = 0; k < 16; k++) {
+    const b = Math.random() * TAU, s = 40 + Math.random() * 110;
+    emit(x, y, Math.cos(b) * s, Math.sin(b) * s, 'rgba(190,178,156,', 5 + Math.random() * 6, 0.7);
+  }
+  forChunksNear(x, y, 200, c => {
+    for (const o of c.statics) {
+      if (RAZE[o.t] && inRect(o, x, y, R)) raze(o);
+      else if (FLORA[o.t] && Math.hypot(o.x - x, o.y - y) < o.r + R) flatten(o, false);
+    }
+    for (const o of c.dyn) if ((o.person || o.animal) && !o.dead && Math.hypot(o.x - x, o.y - y) < o.r + R + 4) {
+      const b = Math.atan2(o.y - y, o.x - x);
+      runOver(o, Math.cos(b), Math.sin(b));
+    }
+  });
+  for (const v of traffic.slice()) {
+    const hit = inRect({ x: v.x, y: v.y, w: v.m.L, h: v.m.W, ang: v.a }, x, y, R) ||
+                (v.tr && inRect({ x: v.tr.x, y: v.tr.y, w: v.m.art, h: v.m.W, ang: v.tr.a }, x, y, R));
+    if (hit) wreck(v, false);
+  }
+}
+// Gebäude stürzt ein: Trümmerhaufen auf dem Grundriss, Staubwolke
+function raze(o) {
+  if (o.t === 'rubble') return;
+  o.was = o.t; o.t = 'rubble'; o.smoke = 5 + Math.random() * 4; o.seed = Math.floor(Math.random() * 1e6);
+  if (!burning.includes(o)) burning.push(o);
+  shake = Math.max(shake, 9);
+  const n = Math.min(40, 10 + (o.w * o.h) / 300);
+  for (let k = 0; k < n; k++) {
+    const b = Math.random() * TAU, s = 30 + Math.random() * 120;
+    emit(o.x + (Math.random() - .5) * o.w * 0.7, o.y + (Math.random() - .5) * o.h * 0.7, Math.cos(b) * s, Math.sin(b) * s,
+         'rgba(176,170,160,', 6 + Math.random() * 8, 0.9 + Math.random() * 0.6);
+  }
+}
+// Bäume und Büsche: zertreten knicken sie um, verbrannt bleibt ein verkohlter Stumpf
+function flatten(o, charred) {
+  const big = o.r;
+  o.t = 'stump'; o.r = Math.min(o.r, 7); o.charred = charred;
+  for (let k = 0; k < 10; k++) {
+    const b = Math.random() * TAU, s = 20 + Math.random() * 70;
+    emit(o.x, o.y, Math.cos(b) * s, Math.sin(b) * s, charred ? 'rgba(60,55,50,' : 'rgba(70,120,50,', 3 + Math.random() * big * 0.3, 0.8);
+  }
+}
+function ignite(o) {
+  if (o.burn > 0) return;
+  o.burn = FLORA[o.t] ? 1.2 + Math.random() : o.t === 'wreck' ? 4 + Math.random() * 2 : 3.5 + Math.random() * 2.5;
+  if (!burning.includes(o)) burning.push(o);
+}
+// Brände lodern über dem Grundriss; danach stürzt das Haus ein bzw. bleibt ein Stumpf, Trümmer rauchen nach
+function updateBurning(dt) {
+  for (let i = burning.length - 1; i >= 0; i--) {
+    const o = burning[i];
+    const w = o.w || o.r * 2, h = o.h || o.r * 2, c = Math.cos(o.ang || 0), s = Math.sin(o.ang || 0);
+    const at = () => { const u = (Math.random() - .5) * w * 0.8, v = (Math.random() - .5) * h * 0.8; return [o.x + u * c - v * s, o.y + u * s + v * c]; };
+    if (o.burn > 0) {
+      o.burn -= dt;
+      const rate = Math.min(60, 8 + w * h / 120);
+      for (let k = 0; k < rate * dt * 3; k++) {
+        const [x, y] = at();
+        emit(x, y, (Math.random() - .5) * 20, (Math.random() - .5) * 20 - 10, '', 4 + Math.random() * 5, 0.6 + Math.random() * 0.6, true);
+      }
+      if (Math.random() < rate * dt * 0.4) { const [x, y] = at(); emit(x, y, 6, -14, 'rgba(60,58,56,', 8 + Math.random() * 8, 2); }
+      if (o.burn <= 0) {
+        if (RAZE[o.t]) raze(o);
+        else if (FLORA[o.t]) flatten(o, true);
+        else if (o.t === 'wreck') o.smoke = 6;
+      }
+    } else if (o.smoke > 0) {
+      o.smoke -= dt;
+      if (Math.random() < dt * Math.min(12, 2 + w * h / 1500)) { const [x, y] = at(); emit(x, y, 8, -12, 'rgba(90,88,86,', 7 + Math.random() * 8, 2.4); }
+    } else burning.splice(i, 1);
+  }
+}
+// Feuerstrahl: Flammenpartikel aus dem Maul; was im Kegel liegt, erhitzt sich und fängt Feuer
+function inBreath(mx, my, x, y, r) {
+  const dx = x - mx, dy = y - my, d = Math.hypot(dx, dy);
+  if (d > BREATH_L + r) return false;
+  const da = Math.abs(Math.atan2(Math.sin(Math.atan2(dy, dx) - car.a), Math.cos(Math.atan2(dy, dx) - car.a)));
+  return da < BREATH_A + r / Math.max(d, 1);
+}
+function breathe(dt) {
+  const [mx, my] = mouthPos(), [fx, fy] = gzFwd();
+  for (let k = 0; k < 9; k++) {
+    const a = car.a + (Math.random() - .5) * 2 * BREATH_A * 0.75, s = 950 + Math.random() * 450;
+    emit(mx, my, Math.cos(a) * s + car.vx, Math.sin(a) * s + car.vy, '', 6 + Math.random() * 8, 0.45 + Math.random() * 0.2, true);
+  }
+  if (Math.random() < 0.4) emit(mx + fx * BREATH_L * 0.8, my + fy * BREATH_L * 0.8, (Math.random() - .5) * 40, -20, 'rgba(70,66,62,', 10 + Math.random() * 8, 1.6);
+  shake = Math.max(shake, 2);
+  const d = Math.random() * BREATH_L, a = car.a + (Math.random() - .5) * 2 * BREATH_A, sx = mx + Math.cos(a) * d, sy = my + Math.sin(a) * d;
+  paintGround(sx, sy, 20, g => { g.fillStyle = 'rgba(25,18,10,0.10)'; g.beginPath(); g.arc(sx, sy, 8 + d * 0.04, 0, TAU); g.fill(); });   // Brandspuren
+  forChunksNear(mx + fx * BREATH_L / 2, my + fy * BREATH_L / 2, BREATH_L / 2 + 120, c => {
+    for (const o of c.statics) {
+      if (!(RAZE[o.t] || FLORA[o.t] || o.t === 'wreck') || o.burn > 0) continue;
+      if (!inBreath(mx, my, o.x, o.y, o.r)) continue;
+      o.heat = (o.heat || 0) + dt;
+      if (o.heat > (FLORA[o.t] ? 0.12 : 0.45)) ignite(o);
+    }
+    for (const o of c.dyn) if ((o.person || o.animal) && !o.dead && inBreath(mx, my, o.x, o.y, o.r)) scorch(o);
+  });
+  for (const v of traffic.slice()) if (inBreath(mx, my, v.x, v.y, v.m.L / 2)) {
+    v.heat = (v.heat || 0) + dt;
+    if (v.heat > 0.25) wreck(v, true);
+  }
+}
+// verkohlt: schwarzer Fleck statt Blut
+function scorch(o) {
+  o.dead = true;
+  paintGround(o.x, o.y, 20, g => {
+    g.fillStyle = 'rgba(20,16,12,0.6)'; g.beginPath(); g.ellipse(o.x, o.y, o.r * 2, o.r * 1.5, Math.random() * 3, 0, TAU); g.fill();
+  });
+  for (let k = 0; k < 6; k++) emit(o.x, o.y, (Math.random() - .5) * 40, -20 - Math.random() * 30, 'rgba(50,48,46,', 3 + Math.random() * 3, 1.2);
+}
+// Fahrzeug wird zum Wrack: zertreten platt, im Feuerstrahl explodiert es und brennt aus
+function wreck(v, fire) {
+  const i = traffic.indexOf(v);
+  if (i < 0) return;
+  traffic.splice(i, 1);
+  const parts = [{ x: v.x, y: v.y, w: v.m.L, h: v.m.W, ang: v.a }];
+  if (v.tr) parts.push({ x: v.tr.x, y: v.tr.y, w: v.m.art, h: v.m.W, ang: v.tr.a });
+  for (const p of parts) {
+    const c = chunkAt(p.x, p.y);
+    if (!c || !c.done) continue;
+    const o = { t: 'wreck', ...p, r: Math.max(p.w, p.h) / 2, col: v.m.col, flat: !fire, seed: Math.floor(Math.random() * 1e6) };
+    c.statics.push(o);
+    if (fire) ignite(o);
+  }
+  if (fire) {
+    shake = Math.max(shake, 8);
+    for (let k = 0; k < 40; k++) {
+      const b = Math.random() * TAU, s = 60 + Math.random() * 220;
+      emit(v.x, v.y, Math.cos(b) * s, Math.sin(b) * s, '', 6 + Math.random() * 8, 0.5 + Math.random() * 0.5, true);
+    }
+    for (let k = 0; k < 14; k++) {
+      const b = Math.random() * TAU, s = 20 + Math.random() * 60;
+      emit(v.x, v.y, Math.cos(b) * s, Math.sin(b) * s, 'rgba(50,48,46,', 10 + Math.random() * 10, 2);
+    }
+  } else {
+    shake = Math.max(shake, 5);
+    for (let k = 0; k < 12; k++) {
+      const b = Math.random() * TAU, s = 40 + Math.random() * 100;
+      emit(v.x, v.y, Math.cos(b) * s, Math.sin(b) * s, 'rgba(255,220,140,', 1.5 + Math.random() * 1.5, 0.3);
+    }
+  }
+}
+
+// ---------- Godzilla zeichnen ----------
+// Draufsicht: Schwanz folgt der gelaufenen Spur, Füße im Gangzyklus, Rückenplatten leuchten beim Feuerstrahl
+function gzTrailPoint(d) {
+  let px = car.x, py = car.y;
+  const T = godz.trail;
+  for (let i = T.length - 1; i >= 0; i--) {
+    const [x, y] = T[i], l = Math.hypot(x - px, y - py);
+    if (l >= d) { const f = d / l; return [px + (x - px) * f, py + (y - py) * f]; }
+    d -= l; px = x; py = y;
+  }
+  return [px - Math.cos(car.a) * d, py - Math.sin(car.a) * d];
+}
+function drawGodzilla() {
+  const fx = Math.cos(car.a), fy = Math.sin(car.a), glow = godz.breath, ph = godz.phase * Math.PI;
+  const skin = '#36463c', dark = '#26322b', plate = glow > 0.05 ? `rgb(${200 - 90 * glow | 0},${215 + 25 * glow | 0},${200 + 55 * glow | 0})` : '#c9ccbd';
+  // Schwanz: Punkte entlang der Spur hinter der Hüfte, leicht pendelnd
+  const tail = [];
+  for (let q = 0; q <= 14; q++) {
+    const d = 30 * GZ + q * 10 * GZ, [x, y] = gzTrailPoint(d), sw = Math.sin(ph * 0.5 + q * 0.45) * q * 0.9;
+    tail.push([x - fy * sw, y + fx * sw, (15 - q * 0.95) * GZ]);
+  }
+  ctx.fillStyle = 'rgba(0,0,0,0.28)';                                // Schatten
+  for (const [x, y, r] of tail) circle(x + 16, y + 20, r);
+  ctx.beginPath(); ctx.ellipse(car.x + 16, car.y + 20, 42 * GZ, 28 * GZ, car.a, 0, TAU); ctx.fill();
+  for (let q = tail.length - 1; q >= 0; q--) {
+    const [x, y, r] = tail[q];
+    ctx.fillStyle = q % 2 ? skin : shadeHex(skin, -0.08); circle(x, y, r);
+  }
+  ctx.fillStyle = plate;                                             // Platten auf dem Schwanz
+  for (let q = 1; q < tail.length - 2; q += 2) circle(tail[q][0], tail[q][1], tail[q][2] * 0.32);
+  ctx.save(); ctx.translate(car.x, car.y); ctx.rotate(car.a); ctx.scale(GZ, GZ);
+  for (const s of [-1, 1]) {                                         // Füße im Gangzyklus
+    const off = Math.sin(ph + (s > 0 ? 0 : Math.PI)) * 12;
+    ctx.fillStyle = dark; ctx.beginPath(); ctx.ellipse(10 + off, s * 18, 12, 8, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#e8e2cc';
+    for (const t of [-4, 0, 4]) { ctx.beginPath(); ctx.moveTo(21 + off, s * 18 + t - 1.5); ctx.lineTo(26 + off, s * 18 + t); ctx.lineTo(21 + off, s * 18 + t + 1.5); ctx.fill(); }
+  }
+  ctx.fillStyle = skin; ctx.beginPath(); ctx.ellipse(0, 0, 38, 24, 0, 0, TAU); ctx.fill();          // Rumpf
+  ctx.fillStyle = 'rgba(0,0,0,0.12)';
+  for (let q = 0; q < 14; q++) circle(hash(q, 1, 77) * 56 - 28, hash(q, 2, 77) * 32 - 16, 2 + hash(q, 3, 77) * 3);
+  ctx.fillStyle = 'rgba(255,255,255,0.08)'; ctx.beginPath(); ctx.ellipse(-2, -9, 30, 8, 0, 0, TAU); ctx.fill();
+  for (const s of [-1, 1]) {                                         // Arme
+    ctx.fillStyle = skin; ctx.beginPath(); ctx.ellipse(26, s * 21, 9, 5, s * 0.5, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#e8e2cc'; circle(34, s * 23, 1.5); circle(33, s * 19, 1.5);
+  }
+  ctx.fillStyle = skin; ctx.beginPath(); ctx.ellipse(40, 0, 12, 10, 0, 0, TAU); ctx.fill();          // Hals
+  ctx.beginPath(); ctx.ellipse(52, 0, 13, 10, 0, 0, TAU); ctx.fill();                               // Kopf
+  ctx.beginPath(); ctx.ellipse(62, 0, 7, 7, 0, 0, TAU); ctx.fill();                                 // Schnauze
+  if (glow > 0.05) {                                                 // offenes Maul mit Glut
+    ctx.fillStyle = `rgba(160,230,255,${(0.9 * glow).toFixed(3)})`; ctx.beginPath(); ctx.ellipse(66, 0, 5, 4, 0, 0, TAU); ctx.fill();
+  }
+  ctx.fillStyle = '#f2c230'; circle(54, -7, 2.2); circle(54, 7, 2.2);                               // Augen
+  ctx.fillStyle = '#1a1a1a'; circle(54.6, -7, 1); circle(54.6, 7, 1);
+  // Rückenplatten: gezackte Reihe von der Hüfte bis zum Nacken
+  for (let q = 0; q < 9; q++) {
+    const x = -32 + q * 8.5, sz = 4 + Math.sin(q / 8 * Math.PI) * 5, s = q % 2 ? 1 : -1;
+    if (glow > 0.05) { ctx.fillStyle = `rgba(120,220,255,${(0.35 * glow).toFixed(3)})`; circle(x, s * 2, sz * 1.8); }
+    ctx.fillStyle = plate;
+    ctx.beginPath(); ctx.moveTo(x - sz, s * 1); ctx.lineTo(x, s * (2 + sz * 1.1)); ctx.lineTo(x + sz, s * 1); ctx.lineTo(x, -s * 1.5); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+// Trümmerhaufen auf dem Grundriss eines eingestürzten Hauses
+function drawRubble(o) {
+  ctx.save(); ctx.translate(o.x, o.y); ctx.rotate(o.ang || 0);
+  const w = o.w, h = o.h, sd = o.seed || 1, base = o.c1 || '#8d9096';
+  ctx.fillStyle = '#6f6a63'; ctx.fillRect(-w / 2, -h / 2, w, h);
+  ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fillRect(-w / 2 + 3, -h / 2 + 3, w - 6, h - 6);
+  const n = Math.min(70, 12 + w * h / 160);
+  for (let i = 0; i < n; i++) {                                       // Brocken, teils in Dachfarbe
+    const x = (hash(sd, i, 1) - .5) * w * 0.95, y = (hash(sd, i, 2) - .5) * h * 0.95, s = 3 + hash(sd, i, 3) * 8;
+    ctx.fillStyle = hash(sd, i, 4) < 0.35 ? base : hash(sd, i, 4) < 0.7 ? '#9b958b' : '#57524c';
+    ctx.save(); ctx.translate(x, y); ctx.rotate(hash(sd, i, 5) * 3); ctx.fillRect(-s / 2, -s / 3, s, s * 0.66); ctx.restore();
+  }
+  ctx.strokeStyle = '#4a4540'; ctx.lineWidth = 2; ctx.beginPath();   // Mauerreste am Rand
+  ctx.moveTo(-w / 2, -h / 2); ctx.lineTo(-w / 2 + w * (0.2 + hash(sd, 9, 1) * 0.4), -h / 2);
+  ctx.moveTo(w / 2, h / 2); ctx.lineTo(w / 2, h / 2 - h * (0.2 + hash(sd, 9, 2) * 0.4));
+  ctx.stroke();
+  if (o.burn > 0 || o.smoke > 3) {                                   // Glut
+    ctx.fillStyle = `rgba(255,${120 + Math.random() * 60 | 0},40,0.35)`;
+    for (let i = 0; i < 5; i++) circle((hash(sd, i, 7) - .5) * w * 0.7, (hash(sd, i, 8) - .5) * h * 0.7, 4 + hash(sd, i, 9) * 5);
+  }
+  ctx.restore();
+}
+// Fahrzeugwrack: platt gedrückt oder ausgebrannt
+function drawWreck(o) {
+  ctx.save(); ctx.translate(o.x, o.y); ctx.rotate(o.ang || 0);
+  const w = o.w * (o.flat ? 1.06 : 1), h = o.h * (o.flat ? 1.15 : 1);
+  ctx.fillStyle = o.flat ? shadeHex(o.col, -0.25) : '#2b2724'; rrect(-w / 2, -h / 2, w, h, 3);
+  ctx.fillStyle = o.flat ? 'rgba(0,0,0,0.25)' : 'rgba(120,70,40,0.45)';
+  for (let i = 0; i < 8; i++) circle((hash(o.seed, i, 1) - .5) * w * 0.8, (hash(o.seed, i, 2) - .5) * h * 0.7, 2 + hash(o.seed, i, 3) * 3);
+  ctx.strokeStyle = 'rgba(0,0,0,0.4)'; ctx.lineWidth = 1; ctx.beginPath();   // Knautschfalten
+  for (let i = 0; i < 4; i++) { const x = (hash(o.seed, i, 4) - .5) * w * 0.8; ctx.moveTo(x, -h / 2); ctx.lineTo(x + 4, h / 2); }
+  ctx.stroke();
+  if (o.burn > 0) { ctx.fillStyle = 'rgba(255,150,40,0.4)'; circle(0, 0, Math.min(w, h) * 0.45); }
+  ctx.restore();
+}
+
+// ---------- Luftschlag ----------
+// B fordert einen Luftschlag auf die aktuelle Position an. Nach 5–10 s überfliegt eine Reaper-Drohne
+// den Ort – aber nur, wenn er dann noch auf der Karte liegt –, klinkt eine Bombe aus und fliegt
+// weiter. Die Explosion verwüstet ein Viertel des sichtbaren Bereichs und hinterlässt einen Krater,
+// in den man hinein- und wieder herausfahren kann (Gefälle zur Mitte, Wall am Rand).
+const strikes = [], craters = [], shockwaves = [];
+const DRONE_V = 480, DRONE_LEAD = 2.6, BOMB_FALL = 1.6, CRATER_G = 200, CRATER_RIM = 140;
+let flash = 0, strikeMsg = '', strikeMsgT = 0;
+function callStrike() {
+  if (strikes.some(st => !st.done)) { strikeMsg = 'Airstrike läuft bereits'; strikeMsgT = 2; return; }   // immer nur einer
+  strikes.push({ x: car.x, y: car.y, t: 5 + Math.random() * 5, a: Math.random() * TAU, drone: false, bomb: false, done: false });
+  strikeMsg = 'Airstrike angefordert'; strikeMsgT = 2;
+}
+const onMap = (x, y) => Math.abs(x - car.x) < MAP_R && Math.abs(y - car.y) < MAP_R;
+// Abwurfpunkt vor dem Ziel: die Bombe fliegt beim Fallen noch ein Stück in Flugrichtung weiter
+function releasePoint(st) {
+  const lead = DRONE_V * BOMB_FALL * 0.5;
+  return [st.x - Math.cos(st.a) * lead, st.y - Math.sin(st.a) * lead];
+}
+function dronePos(st) {
+  const [rx, ry] = releasePoint(st);
+  return [rx - Math.cos(st.a) * DRONE_V * st.t, ry - Math.sin(st.a) * DRONE_V * st.t];
+}
+function updateStrikes(dt) {
+  strikeMsgT -= dt;
+  flash = Math.max(0, flash - dt * 2.5);
+  for (let i = shockwaves.length - 1; i >= 0; i--) {
+    const w = shockwaves[i];
+    w.r += dt * w.max * 2.2;
+    if (w.r > w.max) shockwaves.splice(i, 1);
+  }
+  for (let i = strikes.length - 1; i >= 0; i--) {
+    const st = strikes[i];
+    st.t -= dt;
+    if (!st.drone && st.t <= DRONE_LEAD) {
+      if (!onMap(st.x, st.y)) {
+        strikes.splice(i, 1);
+        strikeMsg = 'Airstrike abgebrochen – Ziel nicht mehr auf der Karte'; strikeMsgT = 3.5;
+        continue;
+      }
+      st.drone = true;
+    }
+    if (st.drone && !st.bomb && st.t <= 0) st.bomb = true;
+    if (st.bomb && !st.done && st.t <= -BOMB_FALL) { st.done = true; explode(st.x, st.y); }
+    if (st.done && st.t < -10) strikes.splice(i, 1);
+  }
+}
+function explode(x, y) {
+  const [x0, y0, x1, y1] = viewBounds(0);
+  const R = clamp(Math.sqrt((x1 - x0) * (y1 - y0) / 4 / Math.PI), 200, 700);   // Fläche = 1/4 der Sicht
+  const cr = { x, y, r: R * 0.42, seed: Math.floor(Math.random() * 1e6) };
+  craters.push(cr);
+  flash = 1; shake = Math.max(shake, 24);
+  shockwaves.push({ x, y, r: 0, max: R * 1.25 });
+  paintGround(x, y, R, g => {                                        // versengter Boden
+    const gr = g.createRadialGradient(x, y, R * 0.3, x, y, R);
+    gr.addColorStop(0, 'rgba(24,18,12,0.55)'); gr.addColorStop(0.7, 'rgba(30,24,16,0.25)'); gr.addColorStop(1, 'rgba(30,24,16,0)');
+    g.fillStyle = gr; g.beginPath(); g.arc(x, y, R, 0, TAU); g.fill();
+  });
+  forChunksNear(x, y, R + 120, c => {
+    for (const o of c.statics) {
+      const d = Math.hypot(o.x - x, o.y - y);
+      if (d > R + (o.r || 0) * 0.5) continue;
+      if (RAZE[o.t]) { raze(o); o.burn = 2 + Math.random() * 4; }    // Trümmer brennen noch
+      else if (FLORA[o.t]) flatten(o, true);
+      else if (o.t === 'wreck') ignite(o);
+    }
+    for (const o of c.dyn) if ((o.person || o.animal) && !o.dead && Math.hypot(o.x - x, o.y - y) < R) scorch(o);
+    applyCrater(c, cr);
+  });
+  for (const v of traffic.slice()) if (Math.hypot(v.x - x, v.y - y) < R) wreck(v, true);
+  const dx = car.x - x, dy = car.y - y, d = Math.hypot(dx, dy) || 1;   // Druckwelle schleudert das Auto weg
+  if (!godz.on && d < R * 1.2) {
+    const f = 1 - d / (R * 1.2);
+    car.vx += dx / d * 900 * f; car.vy += dy / d * 900 * f; car.w += (Math.random() - .5) * 8 * f;
+    if (f > 0.3 && car.air <= 0) car.air = AIR_TIME * 0.7;
+  }
+  for (let k = 0; k < 160; k++) {                                    // Feuerball
+    const b = Math.random() * TAU, s = (0.2 + Math.random() * 0.8) * R * 1.6;
+    emit(x, y, Math.cos(b) * s, Math.sin(b) * s, '', 10 + Math.random() * 14, 0.6 + Math.random() * 0.7, true);
+  }
+  for (let k = 0; k < 70; k++) {                                     // Rauchpilz
+    const b = Math.random() * TAU, s = 20 + Math.random() * 120;
+    emit(x + Math.cos(b) * R * 0.2, y + Math.sin(b) * R * 0.2, Math.cos(b) * s, Math.sin(b) * s - 20, 'rgba(58,54,50,', 20 + Math.random() * 22, 3 + Math.random() * 2.5);
+  }
+  for (let k = 0; k < 60; k++) {                                     // Erdbrocken
+    const b = Math.random() * TAU, s = 200 + Math.random() * 500;
+    emit(x, y, Math.cos(b) * s, Math.sin(b) * s, 'rgba(70,52,34,', 3 + Math.random() * 3, 0.9);
+  }
+}
+// Krater in einen Chunk eintragen: Hindernisse weg, Boden aus losem Schotter, Bild auf den Boden
+function applyCrater(c, cr) {
+  const ox = c.cx * CS, oy = c.cy * CS, R = cr.r, M = R * 1.5;
+  if (cr.x + M < ox || cr.x - M > ox + CS || cr.y + M < oy || cr.y - M > oy + CS) return;
+  c.statics = c.statics.filter(o => Math.hypot(o.x - cr.x, o.y - cr.y) > R * 0.9);
+  for (let j = 0; j < CN; j++) for (let i = 0; i < CN; i++) {
+    const wx = ox + (i + .5) * CELL, wy = oy + (j + .5) * CELL, idx = j * CN + i;
+    if (Math.hypot(wx - cr.x, wy - cr.y) < R && c.surf[idx] !== S_DEEP && c.surf[idx] !== S_SHALLOW) c.surf[idx] = S_GRAVEL;
+  }
+  const g = c.ctx;
+  g.save(); g.translate(-ox, -oy);
+  drawCraterGround(g, cr);
+  g.restore();
+}
+// Krater von oben, Licht von links oben: Auswurf rundum, beschatteter oberer Hang, heller unterer
+// Hang, dunkler Grund, Wall mit Brocken. Zufall nur aus dem Kraterseed, damit alle Chunks passen.
+function drawCraterGround(g, cr) {
+  const { x, y, r: R, seed } = cr;
+  let gr = g.createRadialGradient(x, y, R * 0.9, x, y, R * 1.45);
+  gr.addColorStop(0, 'rgba(92,72,50,0.75)'); gr.addColorStop(1, 'rgba(92,72,50,0)');
+  g.fillStyle = gr; g.beginPath(); g.arc(x, y, R * 1.45, 0, TAU); g.fill();
+  g.fillStyle = '#5c4835'; g.beginPath(); g.arc(x, y, R, 0, TAU); g.fill();
+  g.save(); g.beginPath(); g.arc(x, y, R, 0, TAU); g.clip();
+  gr = g.createLinearGradient(x - R, y - R, x + R, y + R);
+  gr.addColorStop(0, 'rgba(20,14,8,0.55)'); gr.addColorStop(0.5, 'rgba(20,14,8,0)'); gr.addColorStop(1, 'rgba(210,180,140,0.35)');
+  g.fillStyle = gr; g.fillRect(x - R, y - R, 2 * R, 2 * R);
+  gr = g.createRadialGradient(x, y, 0, x, y, R * 0.55);
+  gr.addColorStop(0, 'rgba(25,18,12,0.6)'); gr.addColorStop(1, 'rgba(25,18,12,0)');
+  g.fillStyle = gr; g.beginPath(); g.arc(x, y, R * 0.55, 0, TAU); g.fill();
+  for (let i = 0; i < 40; i++) {                                     // Geröll im Krater
+    const a = hash(seed, i, 1) * TAU, d = hash(seed, i, 2) * R * 0.9, s = 2 + hash(seed, i, 3) * 5;
+    g.fillStyle = hash(seed, i, 4) < 0.5 ? 'rgba(40,30,22,0.6)' : 'rgba(150,126,98,0.6)';
+    g.fillRect(x + Math.cos(a) * d - s / 2, y + Math.sin(a) * d - s / 2, s, s);
+  }
+  g.restore();
+  g.lineWidth = R * 0.07; g.strokeStyle = 'rgba(150,124,92,0.9)';    // Kraterwall
+  g.beginPath(); g.arc(x, y, R, 0, TAU); g.stroke();
+  g.lineWidth = 2; g.strokeStyle = 'rgba(40,30,20,0.6)';
+  g.beginPath(); g.arc(x, y, R * 1.035, 0.6, 3.9); g.stroke();
+  for (let i = 0; i < 70; i++) {                                     // Brocken auf dem Wall und im Auswurf
+    const a = hash(seed, i, 5) * TAU, d = R * (0.95 + hash(seed, i, 6) * 0.45), s = 2 + hash(seed, i, 7) * 6;
+    g.fillStyle = hash(seed, i, 8) < 0.5 ? '#6e5a44' : '#8d7a62';
+    g.fillRect(x + Math.cos(a) * d - s / 2, y + Math.sin(a) * d - s / 2, s, s * 0.7);
+  }
+}
+// Gefälle: im Krater zieht es zur Mitte (hinein schneller, heraus bergauf), außen am Wall nach außen
+function craterForce(dt) {
+  for (const cr of craters) {
+    const dx = car.x - cr.x, dy = car.y - cr.y, d = Math.hypot(dx, dy);
+    if (d > cr.r * 1.2 || d < 1) continue;
+    const a = d < cr.r ? -CRATER_G * (d / cr.r) : CRATER_RIM * (1 - (d - cr.r) / (cr.r * 0.2));
+    car.vx += dx / d * a * dt; car.vy += dy / d * a * dt;
+  }
+}
+const inCrater = (x, y, pad = 1) => craters.some(cr => Math.hypot(x - cr.x, y - cr.y) < cr.r * pad);
+
+// ---------- Luftschlag zeichnen ----------
+function drawReaper(x, y, a) {
+  ctx.save(); ctx.translate(x + 70, y + 90); ctx.rotate(a);         // Schatten tief unten auf dem Boden
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  ctx.fillRect(-55, -5, 110, 10); ctx.fillRect(-8, -100, 18, 200); ctx.fillRect(-55, -22, 10, 44);
+  ctx.restore();
+  ctx.save(); ctx.translate(x, y); ctx.rotate(a);
+  const body = '#9aa1a8', dark = '#6d747b';
+  ctx.fillStyle = body;
+  ctx.beginPath(); ctx.moveTo(-14, -100); ctx.lineTo(4, -100); ctx.lineTo(10, 0); ctx.lineTo(4, 100); ctx.lineTo(-14, 100); ctx.lineTo(-6, 0); ctx.closePath(); ctx.fill();   // Tragflächen
+  ctx.fillStyle = dark; ctx.fillRect(-14, -100, 18, 3); ctx.fillRect(-14, 97, 18, 3);
+  ctx.fillStyle = body;
+  ctx.beginPath(); ctx.moveTo(-52, -26); ctx.lineTo(-40, -26); ctx.lineTo(-36, 0); ctx.lineTo(-40, 26); ctx.lineTo(-52, 26); ctx.lineTo(-46, 0); ctx.closePath(); ctx.fill();   // V-Leitwerk
+  ctx.beginPath(); ctx.ellipse(0, 0, 56, 7, 0, 0, TAU); ctx.fill();                                  // Rumpf
+  ctx.fillStyle = shadeHex(body, 0.25); ctx.beginPath(); ctx.ellipse(36, 0, 18, 8, 0, 0, TAU); ctx.fill();   // Nase mit Satellitenantenne
+  ctx.fillStyle = dark; circle(48, 0, 3.5);                                                          // Sensorkugel
+  ctx.fillStyle = 'rgba(255,255,255,0.18)'; ctx.fillRect(-40, -3, 70, 2);
+  ctx.fillStyle = 'rgba(40,44,50,0.55)';                                                             // Druckpropeller (Bewegungsunschärfe)
+  ctx.beginPath(); ctx.ellipse(-58, 0, 3, 17, 0, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#2b2f35'; circle(-57, 0, 2.5);
+  const blink = Math.floor(clock * 2.5) % 2;
+  ctx.fillStyle = blink ? '#ff3b30' : '#5a1512'; circle(-12, -99, 2);
+  ctx.fillStyle = blink ? '#3bff6e' : '#145a24'; circle(-12, 99, 2);
+  ctx.restore();
+}
+function drawStrikes() {
+  for (const w of shockwaves) {                                      // Druckwelle
+    ctx.strokeStyle = `rgba(255,244,220,${(0.6 * (1 - w.r / w.max)).toFixed(3)})`; ctx.lineWidth = 10;
+    ctx.beginPath(); ctx.arc(w.x, w.y, w.r, 0, TAU); ctx.stroke();
+  }
+  for (const st of strikes) {
+    if (!st.done) {                                                   // Zielmarkierung mit Countdown
+      const p = 0.5 + 0.5 * Math.sin(clock * 6), r = 40 + p * 8;
+      ctx.strokeStyle = `rgba(255,50,40,${(0.5 + 0.4 * p).toFixed(3)})`; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(st.x, st.y, r, 0, TAU); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(st.x - r - 14, st.y); ctx.lineTo(st.x - 10, st.y); ctx.moveTo(st.x + 10, st.y); ctx.lineTo(st.x + r + 14, st.y);
+      ctx.moveTo(st.x, st.y - r - 14); ctx.lineTo(st.x, st.y - 10); ctx.moveTo(st.x, st.y + 10); ctx.lineTo(st.x, st.y + r + 14); ctx.stroke();
+      if (!st.bomb) {
+        ctx.font = '700 22px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.strokeText(Math.ceil(Math.max(0, st.t + BOMB_FALL)), st.x, st.y - r - 28);
+        ctx.fillStyle = '#ff5a4a'; ctx.fillText(Math.ceil(Math.max(0, st.t + BOMB_FALL)), st.x, st.y - r - 28);
+      }
+    }
+    if (st.bomb && !st.done) {                                        // fallende Bombe, kleiner werdend, Schatten rückt heran
+      const p = clamp(-st.t / BOMB_FALL, 0, 1), [rx, ry] = releasePoint(st);
+      const bx = rx + (st.x - rx) * p, by = ry + (st.y - ry) * p, h = 1 - p * p, sc = 1 + h * 1.4;
+      ctx.fillStyle = 'rgba(0,0,0,0.3)'; ctx.beginPath(); ctx.ellipse(bx + 60 * h, by + 75 * h, 9, 4, st.a, 0, TAU); ctx.fill();
+      ctx.save(); ctx.translate(bx, by); ctx.rotate(st.a); ctx.scale(sc, sc);
+      ctx.fillStyle = '#4a5240'; rrect(-10, -3.5, 20, 7, 3.5);
+      ctx.fillStyle = '#353a2e'; ctx.fillRect(-12, -5, 4, 10);
+      ctx.fillStyle = '#e3b23c'; ctx.fillRect(4, -3.5, 1.5, 7);
+      ctx.restore();
+    }
+    if (st.drone) { const [x, y] = dronePos(st); drawReaper(x, y, st.a); }
+  }
+}
+function drawFlash() {
+  if (flash <= 0) return;
+  const T = ctx.getTransform();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = `rgba(255,244,220,${(0.75 * flash).toFixed(3)})`; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.setTransform(T);
+}
+
 // ---------- Fahrassistent ----------
 // Spurhalteassistent: schaut abhängig vom Tempo voraus, erkennt die Fahrtrichtung auf der Straße
 // und lenkt sanft zur Mitte des rechten Fahrstreifens.
@@ -3252,7 +3775,7 @@ function updateCamera(dt) {
   const k = Math.min(1, dt * 4);
   cam.x += (tx - cam.x) * k; cam.y += (ty - cam.y) * k;
   const sp = Math.hypot(car.vx, car.vy);
-  const tz = baseZoom() * (1.08 - 0.3 * clamp(sp / TOP, 0, 1));
+  const tz = godz.on ? baseZoom() * 0.62 : baseZoom() * (1.08 - 0.3 * clamp(sp / TOP, 0, 1));
   cam.z += (tz - cam.z) * Math.min(1, dt * 1.5);
   shake *= Math.exp(-8 * dt);
 }
@@ -3267,7 +3790,7 @@ function drawShadow(o) {
   ctx.fillStyle = 'rgba(0,0,0,0.22)';
   if (o.w) {
     // Schatten als Extrusion des Grundrisses: höhere Gebäude werfen längere Schatten
-    const off = o.t === 'bldg' ? 4 + o.floors * 2.4 : o.t === 'church' ? 11 : 8;
+    const off = o.t === 'bldg' ? 4 + o.floors * 2.4 : o.t === 'church' ? 11 : o.t === 'rubble' || o.t === 'wreck' ? 2 : 8;
     ctx.save(); ctx.translate(o.x, o.y);
     ctx.beginPath();
     for (let q = 0; q <= 4; q++) {
@@ -3340,9 +3863,11 @@ function drawStatic(o) {
       for (let i = 0; i < 6; i++) { const a = i / 6 * TAU; ctx.fillRect(o.x + Math.cos(a) * o.r * .7, o.y + Math.sin(a) * o.r * .7, 1.2, 1.2); }
       break;
     }
+    case 'rubble': drawRubble(o); break;
+    case 'wreck': drawWreck(o); break;
     case 'stump': {
       ctx.fillStyle = '#5a3d24'; circle(o.x, o.y, o.r);
-      ctx.fillStyle = '#b89062'; circle(o.x, o.y, o.r * .75);
+      ctx.fillStyle = o.charred ? '#2a221c' : '#b89062'; circle(o.x, o.y, o.r * .75);
       ctx.strokeStyle = '#8c6a44'; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.arc(o.x, o.y, o.r * .45, 0, TAU); ctx.stroke();
       break;
@@ -3971,9 +4496,9 @@ function render() {
   }
   drawTrains();
   for (const r of rods) if (r.landed) drawRod(r);
-  drawAssist();
+  if (!godz.on) drawAssist();
   drawTraffic(x0, y0, x1, y1);
-  drawCar();
+  if (!godz.on) drawCar();
   for (const L of levels) drawLevel(L);
   for (const r of rods) if (!r.landed) drawRod(r);
   for (const f of flyers) {                                         // Beifahrer samt Sitz im Flug
@@ -4011,6 +4536,7 @@ function render() {
     ctx.fillStyle = 'rgba(232,238,244,0.92)'; ctx.fill(g.snow);
   }
   for (const o of highs) drawStatic(o);
+  if (godz.on) drawGodzilla();                                      // überragt alles
 
   const lamps = [];
   for (const s of settlementsNear(bx0, by0, bx1, by1))
@@ -4018,6 +4544,8 @@ function render() {
   ctx.fillStyle = '#4a4d52';
   for (const l of lamps) circle(l.x, l.y, 2.6);                        // Laternenmasten
   if (nightLevel > 0.01) drawNight(lamps);
+  drawStrikes();                                                    // Drohne hoch über allem, auch nachts sichtbar
+  drawFlash();
 }
 
 // ---------- Nacht ----------
@@ -4053,6 +4581,7 @@ function locoLights(g, col, additive) {
   }
 }
 function carLights(g, col, additive) {
+  if (godz.on) return;
   const per = additive ? 1 / BEAM_LAYERS : 1 - Math.pow(0.05, 1 / BEAM_LAYERS);
   const fx = Math.cos(car.a), fy = Math.sin(car.a), rx = -fy, ry = fx;
   for (const sd of [-1, 1])
@@ -4062,6 +4591,11 @@ function carLights(g, col, additive) {
 // Zusätzliche Lichtquellen des Fahrzeugs und der Flammenspur (Weltkoordinaten)
 function specialLights() {
   const out = [], id = CAR_TYPES[car.type].id, fx = Math.cos(car.a), fy = Math.sin(car.a);
+  if (godz.on) {                                                    // Feuerstrahl und leuchtende Rückenplatten
+    if (godz.breath > 0.05) out.push({ x: car.x + fx * 200 * GZ, y: car.y + fy * 200 * GZ, r: 260, cut: 0.7 * godz.breath, glow: 0.4 * godz.breath, col: a => `rgba(255,150,60,${a.toFixed(3)})` });
+    out.push({ x: car.x, y: car.y, r: 110, cut: 0.35 + 0.4 * godz.breath, glow: 0.1 + 0.35 * godz.breath, col: a => `rgba(120,210,255,${a.toFixed(3)})` });
+    return out;
+  }
   const rgba = (r, g, b) => a => `rgba(${r},${g},${b},${a.toFixed(3)})`;
   if (id === 'police' && car.mode) {
     const s = Math.floor(clock * 7) % 2 ? -1 : 1;
@@ -4141,7 +4675,7 @@ function drawNight(lamps) {
   ctx.lineCap = 'butt';
   const fx = Math.cos(car.a), fy = Math.sin(car.a);
   const tail = car.braking ? 0.75 : 0.35;                                  // Rücklichter
-  for (const sd of [-1, 1]) {
+  if (!godz.on) for (const sd of [-1, 1]) {
     const x = car.x - fx * 23 - fy * 7.5 * sd, y = car.y - fy * 23 + fx * 7.5 * sd;
     radial(ctx, x, y, 14, [[0, `rgba(255,40,30,${tail * k})`], [1, 'rgba(255,40,30,0)']]);
     ctx.beginPath(); ctx.arc(x, y, 14, 0, TAU); ctx.fill();
@@ -4234,6 +4768,11 @@ function drawMap() {
     mctx.fillStyle = w.type === 'loco' ? '#ff5a3c' : '#e9e2d0';
     mctx.fillRect((w.x - car.x) * k + S / 2 - 1.5, (w.y - car.y) * k + S / 2 - 1.5, 3, 3);
   }
+  for (const st of strikes) {                                       // Luftschlag: Ziel und Drohne
+    const x = (st.x - car.x) * k + S / 2, y = (st.y - car.y) * k + S / 2;
+    if (!st.done) { mctx.strokeStyle = '#ff3b30'; mctx.lineWidth = 2; mctx.beginPath(); mctx.arc(x, y, 5, 0, TAU); mctx.moveTo(x - 8, y); mctx.lineTo(x + 8, y); mctx.moveTo(x, y - 8); mctx.lineTo(x, y + 8); mctx.stroke(); }
+    if (st.drone) { const [dx, dy] = dronePos(st); mctx.fillStyle = '#d6dbe0'; mctx.fillRect((dx - car.x) * k + S / 2 - 2, (dy - car.y) * k + S / 2 - 2, 4, 4); }
+  }
   for (const s of mapPlaces) {
     const x = (s.x - car.x) * k + S / 2, y = (s.y - car.y) * k + S / 2;
     mctx.font = s.kind === 'city' ? '700 11px system-ui, sans-serif' : '600 9px system-ui, sans-serif';
@@ -4272,9 +4811,12 @@ function updateHud() {
   const status = T.id === 'kitt' ? (car.air > 0 ? 'Booster!' : car.boostCd > 0 ? 'Booster lädt' : 'Booster bereit (M)')
                : (T.mode ? T.mode[car.mode ? 1 : 0] + ' (M)' : '') +
                  (T.id === 'bond' ? ' · Schleudersitz ' + (bond.ejectCd > 0 ? 'lädt' : 'bereit (E)') : '');
-  const typeText = T.name + (status ? ' · ' + status : '');
+  const typeText = godz.on ? 'Godzilla · Feuerstrahl (Leertaste) · zurück ins Auto (G)' : T.name + (status ? ' · ' + status : '');
   if (elType.textContent !== typeText) elType.textContent = typeText;
-  const at = assistOn ? 'Spurhalteassistent ' + (car.assistActive ? 'lenkt' : 'bereit') + ' (L)' : '';
+  const next = strikes.filter(st => !st.done).sort((a, b) => a.t - b.t)[0];
+  const strikeText = strikeMsgT > 0 ? strikeMsg
+                   : next ? (next.bomb ? 'Airstrike: Bombe fällt!' : next.drone ? 'Airstrike: Drohne im Anflug' : 'Airstrike: Drohne in ' + Math.ceil(next.t) + ' s') : '';
+  const at = [assistOn ? 'Spurhalteassistent ' + (car.assistActive ? 'lenkt' : 'bereit') + ' (L)' : '', strikeText].filter(Boolean).join(' · ');
   if (elAssist.textContent !== at) elAssist.textContent = at;
   if (name !== hudName) {
     hudName = name;
@@ -4315,7 +4857,8 @@ function newWorld(seed) {
   rivCache.clear();
   wetCache.clear();
   rods.length = 0;
-  railCache.clear(); levelCache.clear(); trains.length = 0; traffic.length = 0; worldClock = clock; spawnPoolT = 0;
+  railCache.clear(); levelCache.clear(); trains.length = 0; traffic.length = 0; burning.length = 0;
+  strikes.length = 0; craters.length = 0; shockwaves.length = 0; worldClock = clock; spawnPoolT = 0;
   particles.length = 0;
   spawn = findSpawn();
   Object.assign(car, { x: spawn.x, y: spawn.y, a: spawn.a, vx: 0, vy: 0, w: 0, steer: 0, vf: 0, vl: 0 });
@@ -4335,9 +4878,13 @@ function frame(now) {
   frameNo++;
 
   gatherNearby();
-  computeAssist();
-  const steps = Math.max(1, Math.ceil(dt * 120));
-  for (let i = 0; i < steps; i++) physics(dt / steps);
+  if (godz.on) updateGodzilla(dt);
+  else {
+    computeAssist();
+    const steps = Math.max(1, Math.ceil(dt * 120));
+    for (let i = 0; i < steps; i++) physics(dt / steps);
+    updateBurning(dt);
+  }
   updateDyn(dt);
   effects(dt);
   updateCamera(dt);
@@ -4349,6 +4896,7 @@ function frame(now) {
   rodInfections();
   updateTrains(dt);
   updateTraffic(dt);
+  updateStrikes(dt);
   nightLevel += ((night ? 1 : 0) - nightLevel) * Math.min(1, dt * 2.5);
 
   ensureChunks();
