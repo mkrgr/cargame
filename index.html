@@ -62,6 +62,7 @@
   <div><b>N</b>Nacht an/aus &nbsp; <b style="min-width:0">L</b> Spurhalteassistent</div>
   <div><b>G</b>Godzilla &nbsp; (Leertaste: Feuerstrahl)</div>
   <div><b>B</b>Airstrike (Reaper-Drohne)</div>
+  <div><b>T</b>Ton + Sprache / nur Ton / aus</div>
 </div>
 
 <div id="intro"><div><h1>Car Game</h1><p>Drück eine Taste und fahr los</p></div></div>
@@ -1750,13 +1751,15 @@ const KEYMAP = { ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down', Arr
 let started = false;
 addEventListener('keydown', e => {
   if (KEYMAP[e.code]) { keys[KEYMAP[e.code]] = true; e.preventDefault(); }
-  if (!started) { started = true; document.getElementById('intro').style.opacity = 0; }
+  audioInit();
+  if (!started) { started = true; document.getElementById('intro').style.opacity = 0; setTimeout(() => carSay('enter', { prio: true }), 600); }
   if (e.repeat) return;
   if (e.code === 'KeyR') newWorld(Math.floor(Math.random() * 999999) + 1);
-  if (e.code === 'KeyC' && !godz.on) { car.type = (car.type + 1) % CAR_TYPES.length; car.mode = false; }
+  if (e.code === 'KeyC' && !godz.on) { car.type = (car.type + 1) % CAR_TYPES.length; car.mode = false; sndCarSwitch(); }
   if (e.code === 'KeyM') carAction();
+  if (e.code === 'KeyT') cycleSound();
   if (e.code === 'KeyE') ejectSeat();
-  if (e.code === 'KeyL') assistOn = !assistOn;
+  if (e.code === 'KeyL') { assistOn = !assistOn; say(assistOn ? 'Lane assist on.' : 'Lane assist off.', { voice: CAR_TYPES[car.type].id === 'kitt' ? 'robot' : 'woman', prio: true, gap: 2 }); }
   if (e.code === 'KeyH') document.getElementById('help').classList.toggle('hidden');
   if (e.code === 'KeyN') night = !night;
   if (e.code === 'KeyG') toggleGodzilla();
@@ -1819,7 +1822,7 @@ function updateTurret(dt) {
       const ca = Math.cos(a), sa = Math.sin(a);
       const mx = bx + ca * 16 - sa * side, my = by + sa * 16 + ca * side;
       bullets.push({ x: mx, y: my, vx: ca * BULLET_SPEED + car.vx, vy: sa * BULLET_SPEED + car.vy, life: 0.45 + Math.random() * 0.25 });
-      turret.flash = 0.04;
+      turret.flash = 0.04; sfxShot(0.18);
       // leere Hülse seitlich ausgeworfen
       emit(bx - sa * 6, by + ca * 6, -sa * (60 + Math.random() * 60) + car.vx, ca * (60 + Math.random() * 60) + car.vy,
            'rgba(214,170,70,', 1.2, 0.35);
@@ -1853,7 +1856,7 @@ function updateBond(dt) {
       const mx = car.x + fx * 28 - fy * side, my = car.y + fy * 28 + fx * side;
       const a = car.a + (Math.random() - .5) * 0.05, ca = Math.cos(a), sa = Math.sin(a);
       bullets.push({ x: mx, y: my, vx: ca * BULLET_SPEED + car.vx, vy: sa * BULLET_SPEED + car.vy, life: 0.5 + Math.random() * 0.2 });
-      bond.flash = 0.04;
+      bond.flash = 0.04; sfxShot(0.22);
       emit(mx - fx * 6, my - fy * 6, -fy * side * 12 + car.vx, fx * side * 12 + car.vy, 'rgba(214,170,70,', 1.2, 0.3);
     }
   } else bond.fire = 0;
@@ -1874,6 +1877,7 @@ function ejectSeat() {
                 vx: car.vx * 0.6 - fy * side * lat, vy: car.vy * 0.6 + fx * side * lat,
                 hair: HAIR[Math.floor(Math.random() * HAIR.length)] });
   bond.ejectCd = EJECT_COOLDOWN; bond.hatch = 0.8;
+  sndEject();
   shake = Math.max(shake, 2.5);
   for (let k = 0; k < 10; k++) {
     const a = Math.random() * TAU, s = 20 + Math.random() * 50;
@@ -1908,6 +1912,7 @@ function updateRods(dt) {
                   vy: car.vy * 0.7 + fx * rodSide * out + fy * (Math.random() - .5) * 60,
                   spin: (Math.random() - .5) * 14, t: 0, landed: false, life: ROD_LIFE });
       if (rods.length > ROD_MAX) rods.shift();
+      if (Math.random() < 0.35) sfxRod();
     }
   } else rodTimer = 0.2;
   for (let i = rods.length - 1; i >= 0; i--) {
@@ -1945,6 +1950,7 @@ function rodInfections() {
   }
 }
 function zombify(o) {
+  sndZombify();
   o.zombie = true; o.down = 0; o.cross = 0; o.free = true; o.target = null; o.retarget = 0;
   for (let k = 0; k < 10; k++) {
     const a = Math.random() * TAU, s = 20 + Math.random() * 50;
@@ -1974,12 +1980,13 @@ function carAction() {
     const fx = Math.cos(car.a), fy = Math.sin(car.a), sp = Math.max(car.vf + 320, 560);
     car.vx = fx * sp; car.vy = fy * sp; car.w = 0;
     car.air = AIR_TIME; car.boostCd = BOOST_COOLDOWN;
+    sndAction();
     shake = Math.max(shake, 3);
     for (let k = 0; k < 16; k++) {
       const a = car.a + Math.PI + (Math.random() - .5) * 0.8, s = 60 + Math.random() * 120;
       emit(car.x - fx * 24, car.y - fy * 24, Math.cos(a) * s, Math.sin(a) * s, 'rgba(255,170,60,', 3 + Math.random() * 3, .5);
     }
-  } else if (T.mode) car.mode = !car.mode;
+  } else if (T.mode) { car.mode = !car.mode; sndAction(); }
 }
 
 function physics(dt) {
@@ -1989,7 +1996,7 @@ function physics(dt) {
     car.x += car.vx * dt; car.y += car.vy * dt;
     const d = Math.exp(-0.3 * dt); car.vx *= d; car.vy *= d;
     if (car.air <= 0) {                                             // Landung
-      car.air = 0; shake = Math.max(shake, 5);
+      car.air = 0; shake = Math.max(shake, 5); sndLanded();
       for (let k = 0; k < 20; k++) {
         const a = Math.random() * TAU, s = 40 + Math.random() * 90;
         emit(car.x, car.y, Math.cos(a) * s, Math.sin(a) * s, 'rgba(200,190,170,', 4 + Math.random() * 4, .6);
@@ -2142,6 +2149,7 @@ function collide() {
         o.va += (Math.random() - .5) * j / o.m * 0.08;
         car.vx -= j * nx; car.vy -= j * ny;
         if (o.person && -vrel > 30) { o.down = 1.6; o.cross = 0; }
+        if (-vrel > 40) sndPushed(o);
       }
     }
 
@@ -2282,6 +2290,7 @@ function runOver(o, dirx, diry) {
   car.vx *= o.t === 'cow' ? 0.8 : 0.93; car.vy *= o.t === 'cow' ? 0.8 : 0.93;
   shake = Math.max(shake, o.t === 'cow' ? 5 : 2.5);
   car.bloody = 2.5; // Sekunden mit blutiger Reifenspur
+  sndRunOver(o);
 }
 
 // Zeichnet etwas dauerhaft auf den Boden aller betroffenen Chunks (Weltkoordinaten)
@@ -2476,6 +2485,7 @@ function effects(dt) {
     }
   }
   if (impactAcc > 40) {
+    sndImpact(impactAcc);
     shake = Math.max(shake, Math.min(10, impactAcc / 50));
     for (let k = 0; k < Math.min(14, impactAcc / 20); k++) {
       const a = Math.random() * TAU, s = 30 + Math.random() * 80;
@@ -3158,6 +3168,7 @@ function toggleGodzilla() {
   car.prevW = [null, null, null, null];
   godz.v = 0; godz.trail = []; godz.breath = 0;
   shake = Math.max(shake, 8);
+  sndGodzilla(godz.on);
 }
 function forChunksNear(x, y, rad, fn) {
   for (let cy = Math.floor((y - rad) / CS); cy <= Math.floor((y + rad) / CS); cy++)
@@ -3196,6 +3207,7 @@ function updateGodzilla(dt) {
 // Fußabdruck, Staub und alles im Umkreis zertreten
 function stomp(x, y) {
   shake = Math.max(shake, 6);
+  sfxStomp();
   const a = car.a, R = 15 * GZ;
   paintGround(x, y, 40, g => {
     g.fillStyle = 'rgba(40,30,22,0.32)';
@@ -3332,6 +3344,7 @@ function wreck(v, fire) {
   }
   if (fire) {
     shake = Math.max(shake, 8);
+    sfxBoom(false);
     for (let k = 0; k < 40; k++) {
       const b = Math.random() * TAU, s = 60 + Math.random() * 220;
       emit(v.x, v.y, Math.cos(b) * s, Math.sin(b) * s, '', 6 + Math.random() * 8, 0.5 + Math.random() * 0.5, true);
@@ -3342,6 +3355,7 @@ function wreck(v, fire) {
     }
   } else {
     shake = Math.max(shake, 5);
+    sfxCrash(300);
     for (let k = 0; k < 12; k++) {
       const b = Math.random() * TAU, s = 40 + Math.random() * 100;
       emit(v.x, v.y, Math.cos(b) * s, Math.sin(b) * s, 'rgba(255,220,140,', 1.5 + Math.random() * 1.5, 0.3);
@@ -3456,9 +3470,10 @@ const strikes = [], craters = [], shockwaves = [];
 const DRONE_V = 480, DRONE_LEAD = 2.6, BOMB_FALL = 1.6, CRATER_G = 200, CRATER_RIM = 140;
 let flash = 0, strikeMsg = '', strikeMsgT = 0;
 function callStrike() {
-  if (strikes.some(st => !st.done)) { strikeMsg = 'Airstrike läuft bereits'; strikeMsgT = 2; return; }   // immer nur einer
+  if (strikes.some(st => !st.done)) { strikeMsg = 'Airstrike läuft bereits'; strikeMsgT = 2; sndStrike('busy'); return; }   // immer nur einer
   strikes.push({ x: car.x, y: car.y, t: 5 + Math.random() * 5, a: Math.random() * TAU, drone: false, bomb: false, done: false });
   strikeMsg = 'Airstrike angefordert'; strikeMsgT = 2;
+  sndStrike('call');
 }
 const onMap = (x, y) => Math.abs(x - car.x) < MAP_R && Math.abs(y - car.y) < MAP_R;
 // Abwurfpunkt vor dem Ziel: die Bombe fliegt beim Fallen noch ein Stück in Flugrichtung weiter
@@ -3485,12 +3500,13 @@ function updateStrikes(dt) {
       if (!onMap(st.x, st.y)) {
         strikes.splice(i, 1);
         strikeMsg = 'Airstrike abgebrochen – Ziel nicht mehr auf der Karte'; strikeMsgT = 3.5;
+        sndStrike('abort');
         continue;
       }
-      st.drone = true;
+      st.drone = true; sndStrike('drone');
     }
-    if (st.drone && !st.bomb && st.t <= 0) st.bomb = true;
-    if (st.bomb && !st.done && st.t <= -BOMB_FALL) { st.done = true; explode(st.x, st.y); }
+    if (st.drone && !st.bomb && st.t <= 0) { st.bomb = true; sndStrike('bomb'); }
+    if (st.bomb && !st.done && st.t <= -BOMB_FALL) { st.done = true; explode(st.x, st.y); sndStrike('boom'); }
     if (st.done && st.t < -10) strikes.splice(i, 1);
   }
 }
@@ -4870,6 +4886,325 @@ function newWorld(seed) {
   mapWork(MAP_N);
 }
 
+// ---------- Ton und Sprache ----------
+// Alle Geräusche werden mit WebAudio synthetisiert (Motor, Reifen, Sirene, Schüsse, Explosionen,
+// Godzilla), die gelegentlichen englischen Sprüche kommen aus der Sprachausgabe des Browsers.
+// Funksprüche (Polizei, Reaper) bekommen Rauschsperre-Klicks und Funkrauschen dazu.
+// T schaltet um: Ton + Sprache → nur Ton → aus.
+const SND_MODES = ['Ton + Sprache an', 'nur Ton (keine Sprache)', 'Ton aus'];
+const snd = { ac: null, master: null, noise: null, state: +(localStorage.getItem('cargameSound') || 0) % 3,
+  eng: null, skid: null, siren: null, breath: null, whine: null, drone: null, staticBed: null,
+  crashCd: 0, dohCd: 0, talkCd: 4, chatterT: 12, animalCd: 0, zombieCd: 6, shotCd: 0, lastImpact: 0,
+  prevKmh: 0, prevType: -1, prevMode: false, prevAssist: false, bellT: 0, idleT: 20, sirenT: 0, speedLineCd: 0 };
+const sndOn = () => snd.ac && snd.state < 2;
+const talkOn = () => snd.state === 0 && 'speechSynthesis' in window;
+const pick = a => a[Math.floor(Math.random() * a.length)];
+
+function audioInit() {
+  if (snd.ac) { if (snd.ac.state === 'suspended') snd.ac.resume(); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  const ac = snd.ac = new AC();
+  const comp = ac.createDynamicsCompressor();
+  comp.threshold.value = -14; comp.ratio.value = 6;
+  comp.connect(ac.destination);
+  snd.master = ac.createGain(); snd.master.gain.value = snd.state < 2 ? 0.7 : 0; snd.master.connect(comp);
+  const len = ac.sampleRate * 2, buf = ac.createBuffer(1, len, ac.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  snd.noise = buf;
+  // Motor: zwei verstimmte Oszillatoren durch einen Tiefpass, dazu ein Rauschanteil für das Brummen
+  const e = snd.eng = { a: osc('sawtooth', 50), b: osc('square', 25), lfo: osc('sine', 9), lfoG: gain(0),
+    f: filt('lowpass', 900, 2), g: gain(0), n: loopNoise(), nf: filt('bandpass', 180, 1), ng: gain(0) };
+  e.lfo.connect(e.lfoG); e.lfoG.connect(e.g.gain);
+  e.a.connect(e.f); e.b.connect(e.f); e.f.connect(e.g); e.g.connect(snd.master);
+  e.n.connect(e.nf); e.nf.connect(e.ng); e.ng.connect(snd.master);
+  // Kompressor-Heulen (KITT, Pursuit Special)
+  snd.whine = { o: osc('sine', 800), g: gain(0) }; snd.whine.o.connect(snd.whine.g); snd.whine.g.connect(snd.master);
+  // Reifenquietschen
+  snd.skid = { n: loopNoise(), f: filt('bandpass', 1800, 6), g: gain(0) };
+  snd.skid.n.connect(snd.skid.f); snd.skid.f.connect(snd.skid.g); snd.skid.g.connect(snd.master);
+  // Sirene (eigenes Polizeiauto oder nächstes Einsatzfahrzeug im Verkehr)
+  snd.siren = { o: osc('square', 700), f: filt('lowpass', 2200, 1), g: gain(0) };
+  snd.siren.o.connect(snd.siren.f); snd.siren.f.connect(snd.siren.g); snd.siren.g.connect(snd.master);
+  // Godzillas Feuerstrahl: tiefes, rauschendes Fauchen
+  snd.breath = { n: loopNoise(), f: filt('lowpass', 700, 1), g: gain(0) };
+  snd.breath.n.connect(snd.breath.f); snd.breath.f.connect(snd.breath.g); snd.breath.g.connect(snd.master);
+  // Propellerbrummen der Reaper-Drohne
+  snd.drone = { o: osc('sawtooth', 92), f: filt('lowpass', 500, 3), g: gain(0) };
+  snd.drone.o.connect(snd.drone.f); snd.drone.f.connect(snd.drone.g); snd.drone.g.connect(snd.master);
+  // Funkrauschen unter den Funksprüchen
+  snd.staticBed = { n: loopNoise(), f: filt('bandpass', 2400, 0.8), g: gain(0) };
+  snd.staticBed.n.connect(snd.staticBed.f); snd.staticBed.f.connect(snd.staticBed.g); snd.staticBed.g.connect(snd.master);
+}
+function osc(type, f) { const o = snd.ac.createOscillator(); o.type = type; o.frequency.value = f; o.start(); return o; }
+function gain(v) { const g = snd.ac.createGain(); g.gain.value = v; return g; }
+function filt(type, f, q) { const b = snd.ac.createBiquadFilter(); b.type = type; b.frequency.value = f; b.Q.value = q; return b; }
+function loopNoise() { const s = snd.ac.createBufferSource(); s.buffer = snd.noise; s.loop = true; s.start(); return s; }
+const ramp = (p, v, k = 0.05) => p.setTargetAtTime(v, snd.ac.currentTime, k);
+
+// Kurzer Rauschstoß durch einen Filter (Aufprall, Schuss, Explosion, Klick)
+function burst(dur, vol, type, f0, f1, q = 1, delay = 0) {
+  if (!sndOn()) return;
+  const ac = snd.ac, t = ac.currentTime + delay, s = ac.createBufferSource();
+  s.buffer = snd.noise; s.playbackRate.value = 0.8 + Math.random() * 0.4;
+  const f = filt(type, f0, q), g = gain(0);
+  f.frequency.setValueAtTime(f0, t); f.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  s.connect(f); f.connect(g); g.connect(snd.master);
+  s.start(t, Math.random() * 1.5); s.stop(t + dur + 0.05);
+}
+// Ton mit Tonhöhenverlauf (Wumms, Pfeifen, Hupe, Tierlaute)
+function tone(type, f0, f1, dur, vol, delay = 0, vib = 0) {
+  if (!sndOn()) return;
+  const ac = snd.ac, t = ac.currentTime + delay, o = ac.createOscillator(), g = gain(0);
+  o.type = type;
+  o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(Math.max(10, f1), t + dur);
+  if (vib) { const l = ac.createOscillator(), lg = gain(vib * f0); l.frequency.value = 6; l.connect(lg); lg.connect(o.frequency); l.start(t); l.stop(t + dur + 0.05); }
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + Math.min(0.03, dur * 0.2));
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g); g.connect(snd.master); o.start(t); o.stop(t + dur + 0.05);
+}
+
+// ---- Effekte ----
+function sfxCrash(power) {
+  const v = clamp(power / 400, 0.15, 1);
+  burst(0.35 + v * 0.3, 0.9 * v, 'lowpass', 3500, 200, 0.7);
+  tone('sine', 120, 40, 0.3, 0.8 * v);
+  if (v > 0.4) for (let k = 0; k < 4; k++) burst(0.08, 0.25 * v, 'bandpass', 4000 + Math.random() * 3000, 2500, 8, 0.05 + Math.random() * 0.25);   // Scherben
+}
+function sfxShot(vol = 0.22) {
+  if (snd.shotCd > 0) return;
+  snd.shotCd = 0.05;
+  burst(0.09, vol, 'lowpass', 5000, 300, 0.8);
+  tone('square', 180, 60, 0.05, vol * 0.5);
+}
+function sfxSplat() { burst(0.25, 0.6, 'lowpass', 900, 120, 2); tone('sine', 90, 35, 0.2, 0.6); }
+function sfxWhoosh(dur = 0.6, vol = 0.5) { burst(dur, vol, 'bandpass', 400, 3000, 1.5); }
+function sfxBoom(big) {
+  burst(big ? 3 : 1.2, big ? 1 : 0.8, 'lowpass', big ? 1600 : 2500, 40, 0.5);
+  tone('sine', big ? 70 : 110, 25, big ? 2 : 0.8, 1);
+  if (big) burst(2.5, 0.4, 'bandpass', 600, 100, 0.6, 0.3);                 // nachrollendes Grollen
+}
+function sfxStomp() { tone('sine', 65, 28, 0.5, 1); burst(0.4, 0.5, 'lowpass', 600, 60, 1); }
+function sfxRoar() {
+  tone('sawtooth', 210, 90, 2.2, 0.55, 0, 0.04);
+  tone('sawtooth', 160, 70, 2.4, 0.45, 0.05, 0.06);
+  tone('square', 420, 180, 1.8, 0.12, 0.1, 0.03);
+  burst(2.2, 0.5, 'bandpass', 900, 300, 1.2);
+}
+function sfxBleat() { tone('sawtooth', 520, 470, 0.55, 0.2, 0, 0.08); tone('sawtooth', 780, 700, 0.5, 0.06, 0, 0.08); }
+function sfxMoo() { tone('sawtooth', 140, 105, 1.2, 0.35, 0, 0.015); tone('sawtooth', 280, 210, 1.1, 0.08, 0.02); }
+function sfxSquelch(open) { burst(open ? 0.12 : 0.22, 0.3, 'bandpass', 2600, open ? 3200 : 1800, 1.2); tone('square', open ? 1400 : 1100, open ? 1400 : 900, 0.04, 0.06); }
+function sfxScanner() { for (let k = 0; k < 4; k++) tone('sawtooth', 300, k % 2 ? 300 : 520, 0.32, 0.07, k * 0.34); }
+function sfxHorn(far) { const v = far ? 0.15 : 0.35; tone('sawtooth', 311, 300, 1.6, v); tone('sawtooth', 392, 380, 1.6, v * 0.8); tone('sawtooth', 466, 455, 1.6, v * 0.6); }
+function sfxBell() { tone('triangle', 1250, 1240, 0.35, 0.12); tone('sine', 2500, 2490, 0.25, 0.04); }
+function sfxWhistle() { tone('sine', 2200, 500, BOMB_FALL, 0.18); }
+function sfxRod() { tone('sine', 900, 1300, 0.15, 0.08); for (let k = 0; k < 6; k++) burst(0.02, 0.15, 'highpass', 3000, 3000, 1, 0.2 + Math.random() * 0.8); }   // Geigerzähler
+
+// ---- Sprache ----
+let VOICES = [];
+function loadVoices() { VOICES = speechSynthesis.getVoices().filter(v => /^en/i.test(v.lang) && v.localService); }   // nur lokale Stimmen, keine Online-Stimmen
+if ('speechSynthesis' in window) { loadVoices(); speechSynthesis.onvoiceschanged = loadVoices; }
+function voiceFor(kind) {
+  if (!VOICES.length) loadVoices();
+  const by = (re, pool = VOICES) => { for (const n of re.source.split('|')) { const v = pool.find(v => v.name.startsWith(n)); if (v) return v; } };   // Reihenfolge = Vorrang
+  const gb = VOICES.filter(v => /en[-_]GB/i.test(v.lang)), us = VOICES.filter(v => /en[-_]US/i.test(v.lang));
+  if (kind === 'gb') return by(/Daniel|Arthur|Oliver|George/, gb) || gb[0] || VOICES[0];
+  if (kind === 'au') return by(/Karen|Gordon|Lee/) || VOICES.find(v => /en[-_]AU/i.test(v.lang)) || VOICES[0];
+  if (kind === 'robot') return by(/Fred|Zarvox|Ralph|Trinoids/) || by(/Daniel/) || VOICES[0];
+  if (kind === 'woman') return by(/Samantha|Allison|Ava|Susan|Zoe|Zira/, us) || us[0] || VOICES[0];
+  return by(/Alex|Aaron|Tom|Evan|Nathan|Reed|Rocko|David|Mark/, us) || us[0] || VOICES[0];
+}
+// prio: unterbricht laufende Sprache; sonst nur, wenn gerade niemand spricht und die Pause um ist
+function say(text, o = {}) {
+  if (!talkOn() || !(VOICES.length || (loadVoices(), VOICES.length))) return false;   // ohne lokale englische Stimme schweigen
+  if (!o.prio && (speechSynthesis.speaking || snd.talkCd > 0)) return false;
+  if (o.prio) speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.voice = voiceFor(o.voice || 'us'); u.lang = u.voice ? u.voice.lang : 'en-US';
+  u.pitch = o.pitch ?? 1; u.rate = o.rate ?? 1; u.volume = o.vol ?? 1;
+  snd.talkCd = o.gap ?? 5;
+  if (o.radio && snd.ac) {
+    sfxSquelch(true);
+    ramp(snd.staticBed.g.gain, 0.05, 0.05);
+    const end = () => { ramp(snd.staticBed.g.gain, 0, 0.03); sfxSquelch(false); };
+    u.onend = end; u.onerror = end;
+    setTimeout(() => speechSynthesis.speak(u), 140);
+  } else speechSynthesis.speak(u);
+  return true;
+}
+const radio = (text, o = {}) => say(text, { voice: 'us', rate: 1.12, pitch: 0.9, radio: true, ...o });
+const unit = () => pick(['Adam-12', 'Unit 7', 'Car 54', 'Unit 19', 'Lincoln-3']);
+
+// Sprüche je Fahrzeug: beim Einsteigen, beim Einschalten der Sonderfunktion, beim Crash, ab und zu
+const LINES = {
+  sport:  { voice: 'us', enter: ['Let\'s see what this baby can do.', 'Zero to sixty. Let\'s go.'],
+            crash: ['Oh come on, that was a lease!', 'My paint job!', 'Not the bumper!'],
+            idle: ['Feel that torque.', 'Nobody passes me today.'], fast: ['Now we\'re flying!', 'Two hundred and climbing!'] },
+  police: { voice: 'us', enter: [() => `Dispatch, ${unit()}, back on patrol.`],
+            on: [() => `${unit()} in pursuit, requesting backup.`, 'Code three, lights and sirens.', 'Pull over! Pull over now!'],
+            off: ['Dispatch, pursuit terminated. Returning to patrol.'],
+            crash: ['Dispatch, officer involved collision. I\'m okay.', 'Ten-fifty, minor damage to the unit.'],
+            chatter: ['All units, be advised: a pink sedan was seen leaking glowing material on the highway.',
+                      'Dispatch to all units, reports of a giant lizard downtown. Approach with caution.',
+                      'Ten-four, en route.', 'All units, suspect vehicle is black, possibly talking. Do not engage.',
+                      'Be advised, sheep on the roadway, mile marker twelve.', 'Dispatch, requesting a coffee break. Over.',
+                      'All units, a stainless steel sports car was seen leaving flaming tire tracks.',
+                      'Copy that, responding to a ten-eighty, shots fired from an armored van.'] },
+  bond:   { voice: 'gb', rate: 0.92, enter: ['The name is Double-O-Seven.', 'Rather nice car, Q.'],
+            on: ['Time to use the extras.', 'Q will be furious.'], eject: ['Terribly sorry, darling. This is your stop.', 'Do give my regards to the pavement.'],
+            crash: ['Q won\'t be pleased.', 'That will need a little polish.'], idle: ['Shaken. Not stirred.'] },
+  kitt:   { voice: 'robot', rate: 1.0, pitch: 0.9, enter: ['Good evening, Michael. All systems online.'],
+            boost: ['Turbo boost!', 'Engaging turbo boost.', 'Hold on, Michael.'],
+            crash: ['Michael, my molecular bonded shell is not invulnerable.', 'Please be careful, Michael.'],
+            fast: ['Michael, I must advise you to reduce speed.'], idle: ['Scanning the area, Michael. All clear.'] },
+  dmc:    { voice: 'us', pitch: 1.2, rate: 1.1, enter: ['Flux capacitor: fluxing.'], on: ['Engage the time circuits!'],
+            flame: ['Eighty-eight miles per hour!', 'Great Scott!'], crash: ['This is heavy!', 'Great Scott, the stainless steel!'] },
+  van:    { voice: 'us', pitch: 0.7, rate: 0.95, enter: ['Get in the van, fool!'], on: ['Light \'em up!', 'Nobody gets hurt. Probably.'],
+            off: ['Plan\'s coming together.'], crash: ['Watch the van, fool!'] },
+  homer:  { voice: 'us', pitch: 0.6, rate: 0.9, enter: ['Mmm... donuts.', 'Woo-hoo! Road trip!'], on: ['Woo-hoo!', 'Who needs safety regulations?'],
+            off: ['Mmm... glowing.'], idle: ['Mmm... donuts.', 'Is this thing supposed to glow?'] },
+  interceptor: { voice: 'au', rate: 0.9, pitch: 0.8, enter: ['Last of the V-8s.'], on: ['Hit the blower.', 'Nobody gets in my way.'],
+            crash: ['Fuel tank\'s fine. Keep going.'], idle: ['I just need fuel.'] },
+};
+const lineOf = l => typeof l === 'function' ? l() : l;
+function carSay(key, o = {}) {
+  const T = CAR_TYPES[car.type], L = LINES[T.id];
+  if (!L || !L[key]) return false;
+  const text = lineOf(pick(L[key]));
+  if (T.id === 'police') return radio(text, o);
+  return say(text, { voice: L.voice, pitch: L.pitch, rate: L.rate, ...o });
+}
+
+// ---- Ereignisse aus dem Spiel ----
+function sndImpact(power) {
+  if (!snd.ac || snd.crashCd > 0 || power < snd.lastImpact * 1.4 + 10) { snd.lastImpact = power; return; }
+  snd.lastImpact = power; snd.crashCd = 0.3;
+  sfxCrash(power);
+  if (power < 90) return;
+  const id = CAR_TYPES[car.type].id;
+  if (id === 'homer') {
+    if (snd.dohCd <= 0) { snd.dohCd = 2.5; say(pick(['D\'oh!', 'D\'oh!', 'D\'oh!', 'Why you little!']), { voice: 'us', pitch: 0.55, rate: 0.85, prio: true, gap: 1.5 }); }
+  } else if (Math.random() < 0.4) carSay('crash');
+}
+function sndCarSwitch() { if (snd.ac) { tone('sine', 600, 900, 0.08, 0.1); if (CAR_TYPES[car.type].id === 'kitt') sfxScanner(); } carSay('enter', { prio: true, gap: 6 }); }
+function sndAction() {
+  const T = CAR_TYPES[car.type];
+  if (T.id === 'kitt') { sfxWhoosh(1, 0.7); tone('sawtooth', 200, 1200, 0.8, 0.15); carSay('boost', { prio: true, gap: 3 }); return; }
+  if (!T.mode) return;
+  tone('square', car.mode ? 500 : 700, car.mode ? 900 : 400, 0.1, 0.08);
+  carSay(car.mode ? 'on' : 'off', { prio: true, gap: 6 });
+}
+function sndEject() { sfxWhoosh(0.8, 0.8); tone('square', 300, 1400, 0.25, 0.1); setTimeout(() => carSay('eject', { prio: true }), 300); }
+function sndLanded() { burst(0.3, 0.6, 'lowpass', 1200, 80, 1); tone('sine', 90, 40, 0.25, 0.7); }
+function sndRunOver(o) {
+  sfxSplat();
+  if (o.t === 'sheep') sfxBleat(); else if (o.t === 'cow') sfxMoo();
+}
+function sndPushed(o) {
+  if (snd.animalCd > 0) return;
+  snd.animalCd = 1.2;
+  if (o.t === 'sheep') sfxBleat();
+  else if (o.t === 'cow') sfxMoo();
+  else if (o.person) say(pick(['Hey!', 'Watch it!', 'Are you crazy?', 'Learn to drive!', 'Ow!']), { voice: pick(['us', 'woman', 'gb']), rate: 1.2, gap: 2 });
+}
+function sndZombify() { if (snd.zombieCd <= 0 && say(pick(['Braaains...', 'Uuuhhh...']), { voice: 'us', pitch: 0.1, rate: 0.6, gap: 4 })) snd.zombieCd = 10; }
+function sndGodzilla(on) {
+  if (on) { sfxRoar(); say('Oh no! Godzilla!', { voice: 'woman', pitch: 1.4, rate: 1.3, prio: true, gap: 6 }); }
+  else { sfxStomp(); carSay('enter', { prio: true }); }
+}
+function sndStrike(ev) {
+  if (ev === 'call') { tone('square', 1000, 1000, 0.08, 0.06); tone('square', 1000, 1000, 0.08, 0.06, 0.15);
+    radio(pick(['Reaper one-one, copy. Target acquired, inbound.', 'Roger, fire mission confirmed. Reaper is on the way.']), { prio: true, voice: 'woman', gap: 3 }); }
+  if (ev === 'busy') radio('Negative, strike already in progress.', { prio: true, voice: 'woman', gap: 2 });
+  if (ev === 'drone') radio(pick(['Reaper one-one, on station. Weapon away in three.', 'Danger close! Take cover!']), { prio: true, voice: 'woman', gap: 3 });
+  if (ev === 'bomb') sfxWhistle();
+  if (ev === 'boom') { sfxBoom(true); setTimeout(() => radio(pick(['Good hit, good hit.', 'Target destroyed. Reaper is RTB.']), { voice: 'woman', gap: 3 }), 2500); }
+  if (ev === 'abort') radio('Strike aborted. Target out of range.', { prio: true, voice: 'woman', gap: 3 });
+}
+
+// Dauergeräusche je Frame
+const ENG = {   // Grundfrequenz, Anstieg je px/s, Filter, Rauschen, Heulen, Stottern
+  sport:  { f: 46, k: 0.2, cut: 1600, n: 0.05 },
+  police: { f: 38, k: 0.15, cut: 1100, n: 0.06 },
+  bond:   { f: 42, k: 0.17, cut: 1300, n: 0.05 },
+  kitt:   { f: 40, k: 0.15, cut: 1200, n: 0.04, whine: 0.04 },
+  dmc:    { f: 34, k: 0.13, cut: 900, n: 0.08 },
+  van:    { f: 28, k: 0.1, cut: 650, n: 0.12 },
+  homer:  { f: 30, k: 0.1, cut: 700, n: 0.1, wob: 0.5 },
+  interceptor: { f: 26, k: 0.14, cut: 1000, n: 0.1, whine: 0.06 },
+};
+function updateAudio(dt) {
+  for (const k of ['crashCd', 'dohCd', 'talkCd', 'animalCd', 'zombieCd', 'shotCd', 'speedLineCd']) snd[k] = Math.max(0, snd[k] - dt);
+  snd.lastImpact *= Math.exp(-dt * 6);
+  if (!snd.ac) return;
+  const T = CAR_TYPES[car.type], P = ENG[T.id] || ENG.sport, sp = Math.abs(car.vf), on = snd.state < 2 && started;
+  ramp(snd.master.gain, on ? 0.7 : 0, 0.1);
+  // Motor: Drehzahl steigt mit dem Tempo, fällt beim „Schalten“ wieder etwas ab
+  const e = snd.eng, gearSp = TOP / 5, gear = Math.min(4, Math.floor(sp / gearSp)), rev = (sp - gear * gearSp) / gearSp;
+  const f = godz.on ? 20 : P.f * (1 + gear * 0.35) + rev * P.k * gearSp + (car.air > 0 ? 40 : 0);
+  ramp(e.a.frequency, f, 0.04); ramp(e.b.frequency, f * 0.5 * 1.01, 0.04);
+  ramp(e.f.frequency, P.cut * (0.5 + Math.abs(car.throttle || 0) * 0.6 + sp / TOP * 0.5), 0.08);
+  ramp(e.g.gain, godz.on ? 0 : 0.07 + Math.abs(car.throttle || 0) * 0.07 + sp / TOP * 0.05, 0.08);
+  ramp(e.lfoG.gain, godz.on ? 0 : (P.wob || 0) * 0.08, 0.1);
+  e.lfo.frequency.value = 4 + sp / 60;
+  ramp(e.nf.frequency, 120 + sp * 0.5, 0.1);
+  ramp(e.ng.gain, godz.on ? 0 : P.n * (0.4 + sp / TOP), 0.1);
+  const wh = (P.whine || 0) * (revenge() ? 2.2 : 1) * (car.throttle > 0 ? 1 : 0.3) * Math.min(1, sp / 200);
+  ramp(snd.whine.g.gain, godz.on ? 0 : wh, 0.1); ramp(snd.whine.o.frequency, 600 + sp * 3, 0.05);
+  // Reifen: Querrutschen oder Handbremse bei Tempo, nur auf festem Untergrund laut
+  const slip = car.air > 0 || godz.on ? 0 : clamp((Math.abs(car.vl) - 50) / 200, 0, 1) + (keys.hand && sp > 80 ? 0.4 : 0) + (car.braking && sp > 200 ? 0.25 : 0);
+  const hard = car.ws.filter(s => s === S_ASPHALT).length / 4;
+  ramp(snd.skid.g.gain, Math.min(1, slip) * (0.05 + hard * 0.2), 0.05);
+  ramp(snd.skid.f.frequency, 1300 + hard * 900 + Math.random() * 200, 0.02);
+  // Sirene: eigenes Polizeiauto mit Blaulicht, sonst das nächste Einsatzfahrzeug mit Blaulicht im Verkehr
+  snd.sirenT += dt;
+  let sv = 0, fast = false;
+  if (!godz.on && T.id === 'police' && car.mode) sv = 0.06;
+  else for (const v of traffic) if (v.blue) {
+    const d = Math.hypot(v.x - car.x, v.y - car.y);
+    if (d < 1400) { sv = Math.max(sv, 0.035 * (1 - d / 1400)); fast = v.m.cat === 'fire'; }
+  }
+  const sf = fast ? (Math.floor(snd.sirenT / 0.6) % 2 ? 440 : 587)                        // Feuerwehr: Tatü-tata
+                  : 900 + 450 * Math.sin(snd.sirenT * (T.id === 'police' && car.mode && sp > 300 ? 9 : 2.6));   // Polizei: Heulen, schnell „Yelp“
+  ramp(snd.siren.o.frequency, sf, 0.02); ramp(snd.siren.g.gain, on ? sv : 0, 0.1);
+  // Godzilla-Feuerstrahl
+  ramp(snd.breath.g.gain, godz.on && keys.hand ? 0.6 : 0, 0.08);
+  ramp(snd.breath.f.frequency, 400 + Math.random() * 600, 0.03);
+  // Reaper-Drohne im Anflug
+  let dv = 0;
+  for (const st of strikes) if (st.drone) { const [x, y] = dronePos(st), d = Math.hypot(x - car.x, y - car.y); dv = Math.max(dv, 0.12 * clamp(1 - d / 1600, 0, 1)); }
+  ramp(snd.drone.g.gain, dv, 0.1); snd.drone.o.frequency.value = 92 + Math.sin(clock * 30) * 3;
+  // Bahnübergang läutet, Zug hupt einmal beim Herannahen
+  snd.bellT -= dt;
+  const ring = [...nearLevels()].some(L => L.active && Math.hypot(L.x - car.x, L.y - car.y) < 700);
+  if (ring && snd.bellT <= 0) { snd.bellT = 0.5; sfxBell(); }
+  for (const t of trains) {
+    const h = t.laid[0], d = Math.hypot(h.x - car.x, h.y - car.y);
+    if (!t.honked && d < 900) { t.honked = true; sfxHorn(d > 500); }
+  }
+  // Zombies in der Nähe stöhnen ab und zu
+  if (zombies.length && snd.zombieCd <= 0 && nearestOf(zombies, car, 300) && Math.random() < dt * 0.5) sndZombify();
+  if (godz.on) return;
+  // Fahrzeugsprüche: Polizeifunk, Leerlauf-Sprüche, Tempo-Sprüche, DeLorean bei 88
+  const kmh = sp * KMH;
+  if (T.id === 'dmc' && car.mode && snd.prevKmh < FLAME_KMH && kmh >= FLAME_KMH) carSay('flame', { prio: true, gap: 4 });
+  if (kmh > 170 && snd.prevKmh <= 170 && snd.speedLineCd <= 0 && Math.random() < 0.6 && carSay('fast')) snd.speedLineCd = 25;
+  snd.prevKmh = kmh;
+  if (T.id === 'police') {
+    snd.chatterT -= dt;
+    if (snd.chatterT <= 0) { snd.chatterT = 14 + Math.random() * 18; carSay('chatter'); }
+  }
+  snd.idleT -= dt;
+  if (snd.idleT <= 0) { snd.idleT = 30 + Math.random() * 40; if (T.id === 'homer' && car.mode) sfxRod(); carSay('idle'); }
+}
+function cycleSound() {
+  snd.state = (snd.state + 1) % 3;
+  localStorage.setItem('cargameSound', snd.state);
+  if (snd.state > 0 && 'speechSynthesis' in window) speechSynthesis.cancel();
+  strikeMsg = SND_MODES[snd.state] + ' (T)'; strikeMsgT = 2;
+}
+
 // ---------- Hauptschleife ----------
 let last = performance.now();
 function frame(now) {
@@ -4897,6 +5232,7 @@ function frame(now) {
   updateTrains(dt);
   updateTraffic(dt);
   updateStrikes(dt);
+  updateAudio(dt);
   nightLevel += ((night ? 1 : 0) - nightLevel) * Math.min(1, dt * 2.5);
 
   ensureChunks();
