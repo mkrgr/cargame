@@ -1,5 +1,7 @@
 # Car Game
 
+[Play in Browser](https://mkrgr.github.io/cargame/)
+
 Ein Top-down-Autospiel im Browser mit einer endlosen, prozedural erzeugten Welt: Landstraßen, Städte und Dörfer, Wälder, Gebirge, Flüsse, Bahnlinien, Verkehr, Fußgänger und Tiere – dazu acht Fahrzeuge mit Sonderfunktionen, Godzilla und Luftschläge.
 
 ![Landstraße im Schnee mit Verkehr und Steuerungshilfe](screenshots/landstrasse.jpg)
