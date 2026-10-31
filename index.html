@@ -2086,6 +2086,8 @@ function physics(dt) {
 }
 
 // Stoß zwischen Auto (Kollisionskreis bei px,py) und unbeweglichem Hindernis; n zeigt vom Hindernis zum Auto
+// Für den Ton: was zuletzt getroffen wurde (härtester Stoß im Frame) und wie schnell man an etwas entlangschrammt
+let hitKind = 'wall', impactKind = 'wall', scrapeAcc = 0;
 function resolveStatic(px, py, nx, ny, pen, e, fric = 0.08) {
   car.x += nx * pen; car.y += ny * pen;
   const ox = px - car.x, oy = py - car.y;
@@ -2098,7 +2100,9 @@ function resolveStatic(px, py, nx, ny, pen, e, fric = 0.08) {
   car.w += rn * j * INV_I;
   const tx = -ny, ty = nx, vt = car.vx * tx + car.vy * ty;
   car.vx -= tx * vt * fric; car.vy -= ty * vt * fric;
+  if (-vn > impactAcc) impactKind = hitKind;
   impactAcc = Math.max(impactAcc, -vn);
+  if (hitKind !== 'bush') scrapeAcc = Math.max(scrapeAcc, Math.abs(vt));
 }
 
 function collide() {
@@ -2118,11 +2122,13 @@ function collide() {
           [dx, dy] = m === l ? [-1, 0] : m === r ? [1, 0] : m === t ? [0, -1] : [0, 1];
           d = 1; pen = m + CR;
         }
+        hitKind = o.veh || o.t === 'wreck' ? 'veh' : 'bldg';
         resolveStatic(px, py, (dx * c - dy * sn) / d, (dx * sn + dy * c) / d, pen, .3);
         if (o.veh) { o.veh.hit = 0.8; o.veh.v *= 0.5; }                // angefahrenes Fahrzeug hält an
       } else {
         const rr = o.t === 'tree' || o.t === 'pine' ? o.r * 0.7 : o.t === 'bush' ? o.r * 0.8 : o.r * 0.9;
         const dx = px - o.x, dy = py - o.y, d = Math.hypot(dx, dy), md = CR + rr;
+        hitKind = o.t === 'bush' ? 'bush' : FLORA[o.t] ? 'tree' : o.t === 'wreck' ? 'veh' : 'rock';
         if (d < md && d > 1e-4) resolveStatic(px, py, dx / d, dy / d, md - d, o.t === 'bush' ? .1 : .35);
       }
     }
@@ -2162,6 +2168,7 @@ function collide() {
       }
       let l = Math.hypot(nx, ny);
       if (l < 1e-4) { nx = -car.vx; ny = -car.vy; l = Math.hypot(nx, ny) || 1; }
+      hitKind = 'terrain';
       resolveStatic(px, py, nx / l, ny / l, 2.5, .2);
     }
   }
@@ -2485,7 +2492,7 @@ function effects(dt) {
     }
   }
   if (impactAcc > 40) {
-    sndImpact(impactAcc);
+    sndImpact(impactAcc, impactKind);
     shake = Math.max(shake, Math.min(10, impactAcc / 50));
     for (let k = 0; k < Math.min(14, impactAcc / 20); k++) {
       const a = Math.random() * TAU, s = 30 + Math.random() * 80;
@@ -3355,7 +3362,7 @@ function wreck(v, fire) {
     }
   } else {
     shake = Math.max(shake, 5);
-    sfxCrash(300);
+    sfxCrash(300, 'veh');
     for (let k = 0; k < 12; k++) {
       const b = Math.random() * TAU, s = 40 + Math.random() * 100;
       emit(v.x, v.y, Math.cos(b) * s, Math.sin(b) * s, 'rgba(255,220,140,', 1.5 + Math.random() * 1.5, 0.3);
@@ -4912,14 +4919,23 @@ function audioInit() {
   const len = ac.sampleRate * 2, buf = ac.createBuffer(1, len, ac.sampleRate), d = buf.getChannelData(0);
   for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
   snd.noise = buf;
-  // Motor: zwei verstimmte Oszillatoren durch einen Tiefpass, dazu ein Rauschanteil für das Brummen
-  const e = snd.eng = { a: osc('sawtooth', 50), b: osc('square', 25), lfo: osc('sine', 9), lfoG: gain(0),
-    f: filt('lowpass', 900, 2), g: gain(0), n: loopNoise(), nf: filt('bandpass', 180, 1), ng: gain(0) };
-  e.lfo.connect(e.lfoG); e.lfoG.connect(e.g.gain);
-  e.a.connect(e.f); e.b.connect(e.f); e.f.connect(e.g); e.g.connect(snd.master);
-  e.n.connect(e.nf); e.nf.connect(e.ng); e.ng.connect(snd.master);
+  // Motor: Zündimpulse aus dem AudioWorklet (siehe ENGINE_WORKLET); Fahrgeräusch der Reifen als Rauschen
+  snd.eng = null;
+  if (ac.audioWorklet) {
+    const url = URL.createObjectURL(new Blob([ENGINE_WORKLET], { type: 'application/javascript' }));
+    ac.audioWorklet.addModule(url).then(() => {
+      const n = new AudioWorkletNode(ac, 'engine', { outputChannelCount: [1] }), g = gain(0.9);
+      n.connect(g); g.connect(snd.master);
+      snd.eng = n; snd.engProfile = null;
+    }).catch(() => {});
+  }
+  snd.road = { n: loopNoise(), f: filt('lowpass', 300, 0.7), g: gain(0) };
+  snd.road.n.connect(snd.road.f); snd.road.f.connect(snd.road.g); snd.road.g.connect(snd.master);
   // Kompressor-Heulen (KITT, Pursuit Special)
   snd.whine = { o: osc('sine', 800), g: gain(0) }; snd.whine.o.connect(snd.whine.g); snd.whine.g.connect(snd.master);
+  // Schrammen an Wänden und Leitplanken: verzerrtes, gefiltertes Rauschen
+  snd.scrape = { n: loopNoise(), w: crunchShaper(), f: filt('bandpass', 1400, 1.2), g: gain(0) };
+  snd.scrape.n.connect(snd.scrape.w); snd.scrape.w.connect(snd.scrape.f); snd.scrape.f.connect(snd.scrape.g); snd.scrape.g.connect(snd.master);
   // Reifenquietschen
   snd.skid = { n: loopNoise(), f: filt('bandpass', 1800, 6), g: gain(0) };
   snd.skid.n.connect(snd.skid.f); snd.skid.f.connect(snd.skid.g); snd.skid.g.connect(snd.master);
@@ -4966,11 +4982,72 @@ function tone(type, f0, f1, dur, vol, delay = 0, vib = 0) {
 }
 
 // ---- Effekte ----
-function sfxCrash(power) {
-  const v = clamp(power / 400, 0.15, 1);
-  burst(0.35 + v * 0.3, 0.9 * v, 'lowpass', 3500, 200, 0.7);
-  tone('sine', 120, 40, 0.3, 0.8 * v);
-  if (v > 0.4) for (let k = 0; k < 4; k++) burst(0.08, 0.25 * v, 'bandpass', 4000 + Math.random() * 3000, 2500, 8, 0.05 + Math.random() * 0.25);   // Scherben
+// Crash aus Schichten: dumpfer Schlag, knirschendes Blech (verzerrte Rauschkörner), nachklingendes
+// Metall (unharmonische Teiltöne), splitterndes Glas, nachrieselnde Trümmer. Je nach Hindernis
+// fallen Schichten weg oder kommen dazu (Holz knackt, Busch raschelt, Fels kracht trocken).
+let crunchCurve = null;
+function crunchShaper() {
+  if (!crunchCurve) { crunchCurve = new Float32Array(1024); for (let i = 0; i < 1024; i++) { const x = i / 511.5 - 1; crunchCurve[i] = Math.tanh(x * 6) * (1 - 0.3 * Math.abs(x)); } }
+  const w = snd.ac.createWaveShaper(); w.curve = crunchCurve; w.oversample = '2x'; return w;
+}
+// Rauschkorn mit eigener Hüllkurve, optional über die Verzerrung (Blech) geführt
+function grain(t, dur, vol, type, f, q, crunch) {
+  const ac = snd.ac, s = ac.createBufferSource(), fl = filt(type, f, q), g = gain(0);
+  s.buffer = snd.noise; s.playbackRate.value = 0.6 + Math.random() * 0.8;
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.003);
+  g.gain.exponentialRampToValueAtTime(0.0005, t + dur);
+  if (crunch) { const w = crunchShaper(); s.connect(w); w.connect(fl); } else s.connect(fl);
+  fl.connect(g); g.connect(snd.master);
+  s.start(t, Math.random() * 1.5); s.stop(t + dur + 0.02);
+}
+function ping(t, f, dur, vol, type = 'sine') {
+  const o = snd.ac.createOscillator(), g = gain(0);
+  o.type = type; o.frequency.setValueAtTime(f, t); o.frequency.exponentialRampToValueAtTime(f * (0.97 + Math.random() * 0.02), t + dur);
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.002);
+  g.gain.exponentialRampToValueAtTime(0.0002, t + dur);
+  o.connect(g); g.connect(snd.master); o.start(t); o.stop(t + dur + 0.02);
+}
+function sfxCrash(power, kind = 'wall') {
+  if (!sndOn()) return;
+  const v = clamp(power / 380, 0.12, 1), t = snd.ac.currentTime + 0.005, R = Math.random;
+  if (kind === 'bush') {                                                       // nur Rascheln und Knacken von Zweigen
+    for (let k = 0; k < 10; k++) grain(t + R() * 0.35, 0.05 + R() * 0.08, 0.25 * v, 'highpass', 2500 + R() * 2500, 0.7);
+    for (let k = 0; k < 4; k++) grain(t + R() * 0.25, 0.02, 0.3 * v, 'bandpass', 1500 + R() * 1500, 4);
+    return;
+  }
+  // 1) Schlag: Karosserie und Fahrwerk
+  tone('sine', 95 + R() * 20, 32, 0.35 + v * 0.2, 0.9 * v);
+  grain(t, 0.18 + v * 0.15, 0.9 * v, 'lowpass', 500 + v * 400, 0.8);
+  if (kind === 'tree') {                                                       // Holz: hartes Knacken, splitternde Rinde, Laub
+    grain(t, 0.06, 0.8 * v, 'bandpass', 900, 3);
+    for (let k = 0; k < 6; k++) grain(t + 0.01 + R() * 0.15, 0.02 + R() * 0.03, 0.5 * v, 'bandpass', 1200 + R() * 2000, 5);
+    for (let k = 0; k < 8; k++) grain(t + 0.05 + R() * 0.6, 0.08 + R() * 0.1, 0.12 * v, 'highpass', 3000 + R() * 2000, 0.7);
+  } else if (kind === 'rock' || kind === 'terrain') {                          // Fels/Gelände: trocken, Steine prasseln
+    grain(t, 0.12, 0.7 * v, 'bandpass', 700, 1.5, true);
+    for (let k = 0; k < 4 + v * 10; k++) grain(t + 0.05 + R() * 0.7, 0.015 + R() * 0.03, 0.25 * v, 'bandpass', 1500 + R() * 3000, 3);
+  }
+  // 2) Blech knirscht: dichte, verzerrte Rauschkörner in den ersten Zehntelsekunden
+  const nCr = Math.round(6 + v * 22), spread = 0.12 + v * 0.25;
+  for (let k = 0; k < nCr; k++) {
+    const dt = Math.pow(R(), 1.6) * spread;
+    grain(t + dt, 0.015 + R() * 0.05, (0.35 + R() * 0.4) * v * (1 - dt / spread * 0.6), 'bandpass', 500 + R() * 2600, 1.5 + R() * 3, true);
+  }
+  // 3) Metall klingt nach (bei Fahrzeugen und Gebäuden kräftiger)
+  const ring = kind === 'veh' ? 1 : kind === 'bldg' || kind === 'wall' ? 0.6 : 0.3;
+  const base = 180 + R() * 220;
+  for (const r of [1, 1.58, 2.37, 3.11, 4.73, 6.9]) ping(t + R() * 0.02, base * r * (0.97 + R() * 0.06), 0.25 + v * 0.8 * R(), 0.05 * v * ring / Math.sqrt(r));
+  // 4) Glas: Scheiben, Scheinwerfer – ab mittlerer Wucht
+  if (v > 0.35 && kind !== 'tree') {
+    const gl = kind === 'veh' || kind === 'bldg' || kind === 'wall' ? 1 : 0.5;
+    grain(t + 0.02, 0.18, 0.5 * v * gl, 'highpass', 4000, 0.7);
+    const n = Math.round((8 + v * 30) * gl);
+    for (let k = 0; k < n; k++) {
+      const dt = 0.03 + Math.pow(R(), 1.4) * (0.5 + v * 0.6);
+      ping(t + dt, 2500 + R() * 6000, 0.03 + R() * 0.12, (0.04 + R() * 0.08) * v * (1 - dt / 1.3), R() < 0.5 ? 'sine' : 'triangle');
+    }
+  }
+  // 5) Trümmer rieseln nach: Plastik- und Blechteile
+  for (let k = 0; k < 3 + v * 9; k++) grain(t + 0.15 + R() * (0.4 + v * 0.8), 0.02 + R() * 0.04, (0.08 + R() * 0.15) * v, 'bandpass', 900 + R() * 3000, 2, R() < 0.5);
 }
 function sfxShot(vol = 0.22) {
   if (snd.shotCd > 0) return;
@@ -5077,11 +5154,11 @@ function carSay(key, o = {}) {
 }
 
 // ---- Ereignisse aus dem Spiel ----
-function sndImpact(power) {
+function sndImpact(power, kind) {
   if (!snd.ac || snd.crashCd > 0 || power < snd.lastImpact * 1.4 + 10) { snd.lastImpact = power; return; }
   snd.lastImpact = power; snd.crashCd = 0.3;
-  sfxCrash(power);
-  if (power < 90) return;
+  sfxCrash(power, kind);
+  if (power < 90 || kind === 'bush') return;
   const id = CAR_TYPES[car.type].id;
   if (id === 'homer') {
     if (snd.dohCd <= 0) { snd.dohCd = 2.5; say(pick(['D\'oh!', 'D\'oh!', 'D\'oh!', 'Why you little!']), { voice: 'us', pitch: 0.55, rate: 0.85, prio: true, gap: 1.5 }); }
@@ -5124,34 +5201,112 @@ function sndStrike(ev) {
 }
 
 // Dauergeräusche je Frame
-const ENG = {   // Grundfrequenz, Anstieg je px/s, Filter, Rauschen, Heulen, Stottern
-  sport:  { f: 46, k: 0.2, cut: 1600, n: 0.05 },
-  police: { f: 38, k: 0.15, cut: 1100, n: 0.06 },
-  bond:   { f: 42, k: 0.17, cut: 1300, n: 0.05 },
-  kitt:   { f: 40, k: 0.15, cut: 1200, n: 0.04, whine: 0.04 },
-  dmc:    { f: 34, k: 0.13, cut: 900, n: 0.08 },
-  van:    { f: 28, k: 0.1, cut: 650, n: 0.12 },
-  homer:  { f: 30, k: 0.1, cut: 700, n: 0.1, wob: 0.5 },
-  interceptor: { f: 26, k: 0.14, cut: 1000, n: 0.1, whine: 0.06 },
+// Motorklang: Jede Zündung ist ein kurzer, leicht verrauschter Druckstoß, dessen Stärke von Zylinder
+// zu Zylinder etwas schwankt (Zündfolge, bei V8 mit Kreuzwelle das typische Blubbern). Die Stöße
+// laufen durch drei Resonanzen (Krümmer, Schalldämpfer, Endrohr) und eine weiche Sättigung.
+// Last macht den Klang härter und heller, im Schiebebetrieb wird er dumpf, mit gelegentlichem Knallen.
+const ENGINE_WORKLET = `
+class Engine extends AudioWorkletProcessor {
+  constructor(opt) {
+    super();
+    this.p = { rpm: 800, load: 0, vol: 0, cyl: 8, pat: [1], rough: 0.1, mis: 0, res: [[100, 4, 1]], bright: 1, crackle: 0, drive: 1.5,
+               ...(opt && opt.processorOptions) };
+    this.rpm = this.p.rpm; this.load = 0; this.vol = 0; this.ph = 0; this.k = 0; this.env = 0; this.jit = 0; this.lp = 0; this.pop = 0;
+    this.bq = []; this.coef = null;
+    this.port.onmessage = e => { Object.assign(this.p, e.data); if (e.data.res) this.coef = null; };
+  }
+  process(_, outs) {
+    const o = outs[0][0], sr = sampleRate, p = this.p;
+    if (!this.coef) {
+      this.coef = p.res.map(([f, q, g]) => { const w = 2 * Math.PI * f / sr, al = Math.sin(w) / (2 * q), a0 = 1 + al;
+        return [al / a0 * g, -2 * Math.cos(w) / a0, (1 - al) / a0]; });
+      this.bq = p.res.map(() => [0, 0, 0, 0]);
+    }
+    const kr = 1 - Math.exp(-1 / (0.035 * sr)), kl = 1 - Math.exp(-1 / (0.06 * sr)), kv = 1 - Math.exp(-1 / (0.08 * sr));
+    for (let i = 0; i < o.length; i++) {
+      this.rpm += (p.rpm - this.rpm) * kr; this.load += (p.load - this.load) * kl; this.vol += (p.vol - this.vol) * kv;
+      const ff = this.rpm / 60 * p.cyl / 2;
+      this.ph += ff / sr * (1 + this.jit);
+      if (this.ph >= 1) {
+        this.ph -= 1;
+        const a = p.pat[this.k++ % p.pat.length], miss = Math.random() < p.mis * (1 - this.load * 0.6);
+        this.env = miss ? 0.08 : a * (0.9 + (Math.random() - 0.5) * 0.25 * (1 + p.rough * 2)) * (0.3 + 0.7 * this.load) * (0.7 + this.rpm / 9000);   // Vollgas und hohe Drehzahl lauter
+        this.jit = (Math.random() - 0.5) * p.rough * 0.12;
+        if (p.crackle && this.load < 0.15 && this.rpm > 2800 && Math.random() < p.crackle) this.pop = 0.9 + Math.random() * 0.6;
+      }
+      const tau = (0.22 + 0.25 * (1 - this.load)) / ff;                  // Stoßdauer als Anteil der Zündperiode
+      const nz = 0.15 + 0.35 * this.load;
+      let x = this.env * ((1 - nz) + nz * (Math.random() * 2 - 1));
+      this.env *= Math.exp(-1 / (tau * sr));
+      if (this.pop > 0.01) { x += this.pop * (Math.random() * 2 - 1); this.pop *= 0.985; }
+      x += (Math.random() * 2 - 1) * 0.015 * (0.3 + this.load) * this.rpm / 6000;   // Ansaug- und Mechanikrauschen
+      let y = 0;
+      for (let r = 0; r < this.coef.length; r++) {
+        const [b0, a1, a2] = this.coef[r], s = this.bq[r];
+        const v = b0 * x - b0 * s[1] - a1 * s[2] - a2 * s[3];
+        s[1] = s[0]; s[0] = x; s[3] = s[2]; s[2] = v; y += v;
+      }
+      const c = 1 - Math.exp(-2 * Math.PI * (250 + (400 + this.load * 1600) * p.bright) / sr);
+      this.lp += (x - this.lp) * c;                                     // direkter, gefilterter Körperschall
+      const s = (y * 3 + this.lp * 0.8) * 0.55 * p.drive;
+      o[i] = Math.tanh(s) / Math.tanh(p.drive) * this.vol * 0.35;
+    }
+    return true;
+  }
+}
+registerProcessor('engine', Engine);
+`;
+// Motoren je Fahrzeug: Zylinder, Leerlauf, Drehzahlgrenze, Zündfolge-Stärken, Unruhe, Zündaussetzer,
+// Resonanzen [Hz, Güte, Anteil], Helligkeit, Knallen im Schiebebetrieb, Sättigung, Kompressorheulen
+const V8X = [1, 0.62, 0.95, 0.74, 0.7, 1, 0.8, 0.66];                  // V8 mit Kreuzwelle: ungleichmäßig, blubbernd
+const ENG = {
+  sport:  { cyl: 6, idle: 950, red: 7800, pat: [1, 0.93, 0.98, 0.95, 0.97, 0.91], rough: 0.06, res: [[170, 4, 1], [640, 3, 0.6], [1900, 2.5, 0.3]], bright: 1.3, crackle: 0.04, drive: 2.2 },
+  police: { cyl: 8, idle: 650, red: 5600, pat: V8X, rough: 0.14, res: [[95, 5, 1], [380, 3, 0.5], [1150, 2, 0.15]], bright: 0.8, drive: 1.8 },
+  bond:   { cyl: 12, idle: 750, red: 6800, pat: [1, 0.96, 0.98, 0.95, 1, 0.97, 0.96, 0.99, 0.95, 0.98, 0.97, 0.96], rough: 0.04, res: [[140, 4, 1], [560, 3, 0.55], [1700, 2.5, 0.3]], bright: 1.15, crackle: 0.02, drive: 1.8 },
+  kitt:   { cyl: 8, idle: 700, red: 6000, pat: V8X, rough: 0.1, res: [[110, 5, 1], [430, 3, 0.5], [1300, 2, 0.2]], bright: 1, drive: 1.9, whine: 0.025 },
+  dmc:    { cyl: 6, idle: 800, red: 6200, pat: [1, 0.78, 0.96, 0.84, 0.9, 0.8], rough: 0.14, res: [[130, 4, 1], [480, 3, 0.45], [1400, 2, 0.2]], bright: 0.9, drive: 1.6 },
+  van:    { cyl: 8, idle: 600, red: 4400, pat: V8X, rough: 0.2, res: [[78, 5, 1], [290, 3, 0.45], [880, 2, 0.12]], bright: 0.55, drive: 1.6 },
+  homer:  { cyl: 4, idle: 750, red: 5200, pat: [1, 0.82, 0.96, 0.78], rough: 0.4, mis: 0.05, res: [[160, 3, 1], [540, 2, 0.6], [1600, 1.5, 0.35]], bright: 0.8, drive: 1.4 },
+  interceptor: { cyl: 8, idle: 900, red: 6500, pat: [1, 0.42, 0.95, 0.6, 0.52, 1, 0.72, 0.48], rough: 0.28, res: [[82, 6, 1], [330, 3, 0.55], [1100, 2, 0.22]], bright: 1, crackle: 0.06, drive: 2.4, whine: 0.04 },
 };
+const GEARS = [3.4, 2.25, 1.6, 1.22, 1];                               // Übersetzung relativ zum 5. Gang
+function engineRpm(P, dt) {
+  // Getriebe: Drehzahl folgt der Radgeschwindigkeit im eingelegten Gang; hoch- und runterschalten,
+  // beim Anfahren schleift die Kupplung, im Sprung dreht der Motor frei hoch
+  const sp = Math.abs(car.vf), thr = Math.abs(car.throttle || 0), top = P.red * 0.85 / TOP;
+  if (car.throttle < 0 || car.vf < -5) snd.gear = 0;
+  let g = snd.gear || 0, rpm = sp * GEARS[g] * top;
+  snd.shift = Math.max(0, (snd.shift || 0) - dt);
+  if (g < 4 && car.vf > 0 && rpm > P.red * (thr ? 0.93 : 0.5)) { g++; snd.shift = 0.22; }
+  else if (g > 0 && rpm < P.red * (thr ? 0.42 : 0.26)) { g--; snd.shift = 0.12; }
+  snd.gear = g; rpm = sp * GEARS[g] * top;
+  if (g === 0 && thr) rpm = Math.max(rpm, P.idle + thr * P.red * 0.32);   // Kupplung schleift
+  if (car.air > 0) rpm = thr ? P.red * 0.95 : P.idle * 1.5;
+  rpm = Math.max(rpm, P.idle * (1 + Math.sin(clock * 2.3) * 0.02 * (1 + P.rough * 4)));   // Leerlauf mit leichtem Pendeln
+  const load = snd.shift > 0 ? 0 : car.throttle > 0 || (car.throttle < 0 && car.vf <= 0) ? 1 : 0;
+  return [Math.min(rpm, P.red), load];
+}
 function updateAudio(dt) {
   for (const k of ['crashCd', 'dohCd', 'talkCd', 'animalCd', 'zombieCd', 'shotCd', 'speedLineCd']) snd[k] = Math.max(0, snd[k] - dt);
   snd.lastImpact *= Math.exp(-dt * 6);
   if (!snd.ac) return;
   const T = CAR_TYPES[car.type], P = ENG[T.id] || ENG.sport, sp = Math.abs(car.vf), on = snd.state < 2 && started;
   ramp(snd.master.gain, on ? 0.7 : 0, 0.1);
-  // Motor: Drehzahl steigt mit dem Tempo, fällt beim „Schalten“ wieder etwas ab
-  const e = snd.eng, gearSp = TOP / 5, gear = Math.min(4, Math.floor(sp / gearSp)), rev = (sp - gear * gearSp) / gearSp;
-  const f = godz.on ? 20 : P.f * (1 + gear * 0.35) + rev * P.k * gearSp + (car.air > 0 ? 40 : 0);
-  ramp(e.a.frequency, f, 0.04); ramp(e.b.frequency, f * 0.5 * 1.01, 0.04);
-  ramp(e.f.frequency, P.cut * (0.5 + Math.abs(car.throttle || 0) * 0.6 + sp / TOP * 0.5), 0.08);
-  ramp(e.g.gain, godz.on ? 0 : 0.07 + Math.abs(car.throttle || 0) * 0.07 + sp / TOP * 0.05, 0.08);
-  ramp(e.lfoG.gain, godz.on ? 0 : (P.wob || 0) * 0.08, 0.1);
-  e.lfo.frequency.value = 4 + sp / 60;
-  ramp(e.nf.frequency, 120 + sp * 0.5, 0.1);
-  ramp(e.ng.gain, godz.on ? 0 : P.n * (0.4 + sp / TOP), 0.1);
-  const wh = (P.whine || 0) * (revenge() ? 2.2 : 1) * (car.throttle > 0 ? 1 : 0.3) * Math.min(1, sp / 200);
-  ramp(snd.whine.g.gain, godz.on ? 0 : wh, 0.1); ramp(snd.whine.o.frequency, 600 + sp * 3, 0.05);
+  // Motor
+  const [rpm, load] = engineRpm(P, dt);
+  if (snd.eng) {
+    if (snd.engProfile !== T.id) { snd.engProfile = T.id; snd.eng.port.postMessage({ mis: 0, crackle: 0, ...P }); }
+    snd.eng.port.postMessage({ rpm, load, vol: godz.on ? 0 : 1 });
+  }
+  ramp(snd.road.g.gain, godz.on || car.air > 0 ? 0 : Math.min(1, sp / TOP) * 0.12, 0.1);    // Abrollgeräusch
+  ramp(snd.road.f.frequency, 200 + sp * 1.2, 0.1);
+  const wh = (P.whine || 0) * (revenge() ? 2.2 : 1) * (load ? 1 : 0.3) * Math.min(1, rpm / P.red * 1.5);
+  ramp(snd.whine.g.gain, godz.on ? 0 : wh, 0.1); ramp(snd.whine.o.frequency, rpm * 0.45, 0.03);   // Kompressor dreht mit dem Motor
+  // Schrammen: solange man mit Tempo an etwas entlangreibt
+  const scr = car.air > 0 || godz.on ? 0 : clamp((scrapeAcc - 25) / 250, 0, 1);
+  ramp(snd.scrape.g.gain, scr * 0.28, scr > 0 ? 0.02 : 0.08);
+  ramp(snd.scrape.f.frequency, 700 + scrapeAcc * 3 + Math.random() * 500, 0.02);
+  scrapeAcc = 0;
   // Reifen: Querrutschen oder Handbremse bei Tempo, nur auf festem Untergrund laut
   const slip = car.air > 0 || godz.on ? 0 : clamp((Math.abs(car.vl) - 50) / 200, 0, 1) + (keys.hand && sp > 80 ? 0.4 : 0) + (car.braking && sp > 200 ? 0.25 : 0);
   const hard = car.ws.filter(s => s === S_ASPHALT).length / 4;
