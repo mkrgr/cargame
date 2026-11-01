@@ -31,6 +31,17 @@ Jede Welt hat eine Nummer (unten in der Karte). Über den URL-Hash lässt sich e
 | R | Neue Welt |
 | H | Hilfe ein-/ausblenden |
 
+### iPad und Touch
+
+Auf Touch-Geräten erscheint automatisch eine Bildschirmsteuerung:
+
+- **Stick links unten:** nach oben Gas geben (stufenlos), nach unten bremsen bzw. rückwärts fahren, seitlich stufenlos lenken.
+- **Knöpfe rechts unten:** Handbremse (halten; als Godzilla: Feuer), Spezial (Sonderfunktion), darüber Auto, Nacht, Spur, Ton, Welt, Godzilla, Airstrike und – nur beim 007 – Sitz (Schleudersitz).
+
+Stick und Knöpfe lassen sich gleichzeitig benutzen, z. B. Gas geben und dabei die Handbremse ziehen. Ton und Sprache starten nach der ersten Berührung.
+
+![Touch-Steuerung auf dem iPad](screenshots/ipad.jpg)
+
 ## Fahrzeuge
 
 | Fahrzeug | Sonderfunktion (M) |
